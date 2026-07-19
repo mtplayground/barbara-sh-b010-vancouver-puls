@@ -9,9 +9,9 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub async fn connect(config: &AppConfig) -> Result<PgPool> {
     PgPoolOptions::new()
-        .max_connections(config.database_max_connections())
+        .max_connections(config.database.max_connections)
         .acquire_timeout(Duration::from_secs(10))
-        .connect(config.database_url())
+        .connect(&config.database.url)
         .await
         .context("failed to connect to PostgreSQL")
 }

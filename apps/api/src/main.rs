@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
+    config.log_summary();
     let pool = db::connect(&config).await?;
     db::migrate(&pool).await?;
 
@@ -48,7 +49,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let bind_addr = config.bind_addr()?;
+    let bind_addr = config.server.bind_addr()?;
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind HTTP listener on {bind_addr}"))?;

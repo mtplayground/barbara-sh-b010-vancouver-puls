@@ -1,9 +1,13 @@
 import type {
   ApiErrorPayload,
+  AdminUserResponse,
+  AdminUsersResponse,
   AuthSessionResponse,
+  CreateInviteResponse,
   DatabaseHealthResponse,
   HealthResponse,
   StorageHealthResponse,
+  UserRole,
 } from "./types";
 
 const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL;
@@ -26,6 +30,23 @@ export const apiClient = {
   getStorageHealth: () => request<StorageHealthResponse>("/api/health/storage"),
   getAuthSession: () => request<AuthSessionResponse>("/api/auth/session"),
   getLoginUrl: () => apiUrl("/api/auth/login"),
+  listAdminUsers: () => request<AdminUsersResponse>("/api/admin/users"),
+  inviteEditor: (email: string) =>
+    request<CreateInviteResponse>("/api/admin/invites", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ email }),
+    }),
+  updateUserRole: (sub: string, role: UserRole) =>
+    request<AdminUserResponse>(`/api/admin/users/${encodeURIComponent(sub)}/role`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ role }),
+    }),
 };
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {

@@ -70,6 +70,15 @@ impl ApiError {
         }
     }
 
+    pub fn not_found_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+            source: None,
+        }
+    }
+
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,

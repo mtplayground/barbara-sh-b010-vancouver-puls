@@ -11,10 +11,10 @@ use api::{
     users::{User, UserRole},
 };
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{header::COOKIE, HeaderMap},
     response::Redirect,
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,28 @@ struct AuthSessionUser {
     email: String,
     name: Option<String>,
     picture_url: Option<String>,
+    role: UserRole,
+}
+
+#[derive(Debug, Serialize)]
+struct UsersResponse {
+    users: Vec<UserResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct UserResponse {
+    sub: String,
+    email: String,
+    name: Option<String>,
+    picture_url: Option<String>,
+    role: UserRole,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateUserRoleRequest {
     role: UserRole,
 }
 
@@ -176,6 +198,8 @@ fn app(
         .route("/api/auth/login", get(auth_login))
         .route("/api/auth/session", get(auth_session))
         .route("/api/admin/invites", post(create_invite))
+        .route("/api/admin/users", get(list_admin_users))
+        .route("/api/admin/users/:sub/role", patch(update_admin_user_role))
         .route(
             "/api/invites/accept",
             get(accept_invite_redirect).post(accept_invite),
@@ -266,6 +290,49 @@ async fn auth_session(
         },
         None => AuthSessionResponse::anonymous(),
     }))
+}
+
+async fn list_admin_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<UsersResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+
+    let users = api::users::list_users(&state.db)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(UserResponse::from)
+        .collect();
+
+    Ok(Json(UsersResponse { users }))
+}
+
+async fn update_admin_user_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sub): Path<String>,
+    Json(payload): Json<UpdateUserRoleRequest>,
+) -> Result<Json<UserResponse>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let sub = sub.trim();
+
+    if sub.is_empty() {
+        return Err(ApiError::bad_request("user id is required"));
+    }
+
+    if admin.user.sub == sub && payload.role != UserRole::Admin {
+        return Err(ApiError::bad_request(
+            "admins cannot remove their own admin role",
+        ));
+    }
+
+    let user = api::users::update_user_role(&state.db, sub, payload.role)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("user was not found"))?;
+
+    Ok(Json(UserResponse::from(user)))
 }
 
 async fn create_invite(
@@ -426,6 +493,21 @@ impl From<User> for AuthSessionUser {
             name: user.name,
             picture_url: user.picture_url,
             role: user.role,
+        }
+    }
+}
+
+impl From<User> for UserResponse {
+    fn from(user: User) -> Self {
+        Self {
+            sub: user.sub,
+            email: user.email,
+            name: user.name,
+            picture_url: user.picture_url,
+            role: user.role,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+            last_seen_at: user.last_seen_at,
         }
     }
 }

@@ -49,3 +49,18 @@ Build the backend:
 ```bash
 cargo build
 ```
+
+Run all checks:
+
+```bash
+npm run check
+```
+
+Useful individual checks:
+
+```bash
+npm run typecheck:web
+npm run lint:web
+npm run lint:api
+npm run format:check
+```

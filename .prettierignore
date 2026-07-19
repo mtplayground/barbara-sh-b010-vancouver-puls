@@ -1,0 +1,11 @@
+node_modules
+target
+apps/web/dist
+*.tsbuildinfo
+Cargo.lock
+package-lock.json
+.env
+.env.*
+.database_url
+.gh_token
+.progress

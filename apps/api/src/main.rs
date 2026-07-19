@@ -1,6 +1,20 @@
 use anyhow::{Context, Result};
-use api::{config::AppConfig, cors::cors_layer, db, error::ApiError, storage::ObjectStorage};
-use axum::{extract::State, routing::get, Json, Router};
+use api::{
+    auth::{self, AuthService},
+    config::AppConfig,
+    cors::cors_layer,
+    db,
+    error::ApiError,
+    storage::ObjectStorage,
+    users::{User, UserRole},
+};
+use axum::{
+    extract::State,
+    http::{header::COOKIE, HeaderMap},
+    response::Redirect,
+    routing::get,
+    Json, Router,
+};
 use serde::Serialize;
 use sqlx::PgPool;
 use std::env;
@@ -13,6 +27,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 struct AppState {
     db: PgPool,
     storage: Option<ObjectStorage>,
+    auth: Option<AuthService>,
+    self_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,12 +51,28 @@ struct StorageHealthResponse {
     prefix: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct AuthSessionResponse {
+    authenticated: bool,
+    user: Option<AuthSessionUser>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthSessionUser {
+    sub: String,
+    email: String,
+    name: Option<String>,
+    picture_url: Option<String>,
+    role: UserRole,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
     config.log_summary();
+    let auth = config.auth.clone().map(AuthService::new);
     let storage = match &config.object_storage {
         Some(object_storage_config) => {
             Some(ObjectStorage::from_config(object_storage_config).await?)
@@ -62,7 +94,7 @@ async fn main() -> Result<()> {
 
     info!("api listening on {bind_addr}");
 
-    axum::serve(listener, app(pool, storage, config))
+    axum::serve(listener, app(pool, storage, auth, config))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("api server failed")?;
@@ -70,14 +102,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn app(pool: PgPool, storage: Option<ObjectStorage>, config: AppConfig) -> Router {
-    let state = AppState { db: pool, storage };
+fn app(
+    pool: PgPool,
+    storage: Option<ObjectStorage>,
+    auth: Option<AuthService>,
+    config: AppConfig,
+) -> Router {
+    let state = AppState {
+        db: pool,
+        storage,
+        auth,
+        self_url: config.server.self_url.clone(),
+    };
 
     Router::new()
         .route("/healthz", get(health))
         .route("/api/health", get(health))
         .route("/api/health/db", get(database_health))
         .route("/api/health/storage", get(storage_health))
+        .route("/api/auth/login", get(auth_login))
+        .route("/api/auth/session", get(auth_session))
         .fallback(api_not_found)
         .layer(cors_layer(&config.server))
         .layer(
@@ -126,6 +170,65 @@ async fn storage_health(
         bucket: Some(storage.bucket().to_owned()),
         prefix: Some(storage.prefix().to_owned()),
     }))
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Redirect, ApiError> {
+    let Some(auth) = &state.auth else {
+        return Err(ApiError::service_unavailable(
+            "auth service is not configured",
+        ));
+    };
+
+    let return_to = auth::frontend_root_return_to(&headers, state.self_url.as_deref());
+    let login_url = auth.login_url(&return_to).map_err(ApiError::internal)?;
+
+    Ok(Redirect::to(&login_url))
+}
+
+async fn auth_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthSessionResponse>, ApiError> {
+    let Some(auth) = &state.auth else {
+        return Ok(Json(AuthSessionResponse::anonymous()));
+    };
+
+    let authenticated_user = auth
+        .authenticate_cookie_header(&state.db, headers.get(COOKIE))
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok(Json(match authenticated_user {
+        Some(authenticated_user) => AuthSessionResponse {
+            authenticated: true,
+            user: Some(AuthSessionUser::from(authenticated_user.user)),
+        },
+        None => AuthSessionResponse::anonymous(),
+    }))
+}
+
+impl AuthSessionResponse {
+    fn anonymous() -> Self {
+        Self {
+            authenticated: false,
+            user: None,
+        }
+    }
+}
+
+impl From<User> for AuthSessionUser {
+    fn from(user: User) -> Self {
+        Self {
+            sub: user.sub,
+            email: user.email,
+            name: user.name,
+            picture_url: user.picture_url,
+            role: user.role,
+        }
+    }
 }
 
 async fn api_not_found() -> ApiError {

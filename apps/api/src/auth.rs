@@ -1,9 +1,10 @@
 use anyhow::{bail, Context, Result};
-use axum::http::HeaderValue;
+use axum::http::{header::ORIGIN, HeaderMap, HeaderValue};
 use cookie::Cookie;
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use url::Url;
 
 use crate::{
     config::AuthConfig,
@@ -54,6 +55,20 @@ impl AuthService {
             client: reqwest::Client::new(),
             config,
         }
+    }
+
+    pub fn login_url(&self, return_to: &str) -> Result<String> {
+        let mut login_url = Url::parse(&self.config.url)
+            .context("MCTAI_AUTH_URL must be a valid URL")?
+            .join("login")
+            .context("failed to build auth login URL")?;
+
+        login_url
+            .query_pairs_mut()
+            .append_pair("app_token", &self.config.app_token)
+            .append_pair("return_to", return_to);
+
+        Ok(login_url.into())
     }
 
     pub async fn authenticate_cookie_header(
@@ -148,11 +163,67 @@ fn session_cookie_value(cookie_header: Option<&HeaderValue>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+pub fn frontend_root_return_to(headers: &HeaderMap, configured_self_url: Option<&str>) -> String {
+    if let Some(return_to) = configured_self_url.and_then(root_url_from_public_url) {
+        return return_to;
+    }
+
+    if let Some(return_to) = root_url_from_forwarded_headers(headers) {
+        return return_to;
+    }
+
+    if let Some(return_to) = headers
+        .get(ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+        .and_then(root_url_from_public_url)
+    {
+        return return_to;
+    }
+
+    "/".to_owned()
+}
+
+fn root_url_from_forwarded_headers(headers: &HeaderMap) -> Option<String> {
+    let host = first_forwarded_value(headers.get("x-forwarded-host")?)?;
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(first_forwarded_value)
+        .unwrap_or("https");
+
+    if proto != "http" && proto != "https" {
+        return None;
+    }
+
+    root_url_from_public_url(&format!("{proto}://{host}"))
+}
+
+fn first_forwarded_value(value: &HeaderValue) -> Option<&str> {
+    value.to_str().ok()?.split(',').next().map(str::trim)
+}
+
+fn root_url_from_public_url(value: &str) -> Option<String> {
+    let mut url = Url::parse(value).ok()?;
+
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return None;
+    }
+
+    url.set_path("/");
+    url.set_query(None);
+    url.set_fragment(None);
+
+    Some(url.into())
+}
+
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{session_cookie_value, Audience, SessionClaims};
+    use crate::config::AuthConfig;
+
+    use super::{
+        frontend_root_return_to, session_cookie_value, Audience, AuthService, SessionClaims,
+    };
 
     #[test]
     fn extracts_mctai_session_cookie() {
@@ -201,5 +272,60 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn builds_managed_auth_login_url() -> anyhow::Result<()> {
+        let service = AuthService::new(AuthConfig {
+            url: "https://auth.mctai.app".to_owned(),
+            app_token: "app_token".to_owned(),
+            jwks_url: "https://auth.mctai.app/.well-known/jwks.json".to_owned(),
+        });
+
+        let login_url = service.login_url("https://app.example.com/")?;
+        let parsed = url::Url::parse(&login_url)?;
+        let query_pairs = parsed.query_pairs().collect::<Vec<_>>();
+
+        assert_eq!(parsed.as_str(), login_url);
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("auth.mctai.app"));
+        assert_eq!(parsed.path(), "/login");
+        assert!(query_pairs
+            .iter()
+            .any(|(key, value)| key == "app_token" && value == "app_token"));
+        assert!(query_pairs
+            .iter()
+            .any(|(key, value)| key == "return_to" && value == "https://app.example.com/"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn configured_self_url_wins_for_return_to() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("proxy.example.com"),
+        );
+
+        assert_eq!(
+            frontend_root_return_to(&headers, Some("https://app.example.com/dashboard")),
+            "https://app.example.com/"
+        );
+    }
+
+    #[test]
+    fn forwarded_host_builds_public_return_to() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-host",
+            HeaderValue::from_static("app.example.com, internal"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        assert_eq!(
+            frontend_root_return_to(&headers, None),
+            "https://app.example.com/"
+        );
     }
 }

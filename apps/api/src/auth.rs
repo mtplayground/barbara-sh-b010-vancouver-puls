@@ -1,5 +1,10 @@
 use anyhow::{bail, Context, Result};
-use axum::http::{header::ORIGIN, HeaderMap, HeaderValue};
+use axum::{
+    extract::{Request, State},
+    http::{header::ORIGIN, HeaderMap, HeaderValue},
+    middleware::Next,
+    response::Response,
+};
 use cookie::Cookie;
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -8,6 +13,7 @@ use url::Url;
 
 use crate::{
     config::AuthConfig,
+    error::ApiError,
     users::{self, AuthUserProfile, User, UserRole},
 };
 
@@ -47,6 +53,43 @@ pub enum Audience {
 pub struct AuthenticatedUser {
     pub claims: SessionClaims,
     pub user: User,
+}
+
+#[derive(Debug, Clone)]
+pub struct CurrentUser(pub AuthenticatedUser);
+
+#[derive(Clone)]
+pub struct AuthLayerState {
+    pub pool: PgPool,
+    pub auth: AuthService,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Admin,
+    ManageUsers,
+    ManageAllContent,
+    DraftContent,
+    EditContent,
+    ScheduleContent,
+}
+
+#[derive(Clone)]
+pub struct RoleGuardState {
+    pub auth: AuthLayerState,
+    pub permission: Permission,
+}
+
+impl Permission {
+    pub fn allows(self, role: UserRole) -> bool {
+        match self {
+            Self::Admin | Self::ManageUsers => role.can_manage_users(),
+            Self::ManageAllContent => role.can_manage_all_content(),
+            Self::DraftContent => role.can_draft_content(),
+            Self::EditContent => role.can_edit_content(),
+            Self::ScheduleContent => role.can_schedule_content(),
+        }
+    }
 }
 
 impl AuthService {
@@ -153,6 +196,52 @@ impl AuthService {
     }
 }
 
+pub async fn require_authenticated(
+    State(state): State<AuthLayerState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authenticated_user = authenticate_request(&state, &request).await?;
+    request
+        .extensions_mut()
+        .insert(CurrentUser(authenticated_user));
+
+    Ok(next.run(request).await)
+}
+
+pub async fn require_permission(
+    State(state): State<RoleGuardState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let authenticated_user = authenticate_request(&state.auth, &request).await?;
+
+    if !state.permission.allows(authenticated_user.user.role) {
+        return Err(ApiError::forbidden("insufficient role permissions"));
+    }
+
+    request
+        .extensions_mut()
+        .insert(CurrentUser(authenticated_user));
+
+    Ok(next.run(request).await)
+}
+
+async fn authenticate_request(
+    state: &AuthLayerState,
+    request: &Request,
+) -> Result<AuthenticatedUser, ApiError> {
+    state
+        .auth
+        .authenticate_cookie_header(
+            &state.pool,
+            request.headers().get(axum::http::header::COOKIE),
+        )
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::unauthorized("valid session is required"))
+}
+
 fn session_cookie_value(cookie_header: Option<&HeaderValue>) -> Option<String> {
     let cookie_header = cookie_header?.to_str().ok()?;
 
@@ -222,7 +311,8 @@ mod tests {
     use crate::config::AuthConfig;
 
     use super::{
-        frontend_root_return_to, session_cookie_value, Audience, AuthService, SessionClaims,
+        frontend_root_return_to, session_cookie_value, Audience, AuthService, Permission,
+        SessionClaims,
     };
 
     #[test]
@@ -327,5 +417,23 @@ mod tests {
             frontend_root_return_to(&headers, None),
             "https://app.example.com/"
         );
+    }
+
+    #[test]
+    fn admin_permissions_allow_admin_only_actions() {
+        assert!(Permission::Admin.allows(crate::users::UserRole::Admin));
+        assert!(Permission::ManageUsers.allows(crate::users::UserRole::Admin));
+        assert!(Permission::ManageAllContent.allows(crate::users::UserRole::Admin));
+
+        assert!(!Permission::Admin.allows(crate::users::UserRole::Editor));
+        assert!(!Permission::ManageUsers.allows(crate::users::UserRole::Editor));
+        assert!(!Permission::ManageAllContent.allows(crate::users::UserRole::Editor));
+    }
+
+    #[test]
+    fn editor_permissions_allow_content_actions() {
+        assert!(Permission::DraftContent.allows(crate::users::UserRole::Editor));
+        assert!(Permission::EditContent.allows(crate::users::UserRole::Editor));
+        assert!(Permission::ScheduleContent.allows(crate::users::UserRole::Editor));
     }
 }

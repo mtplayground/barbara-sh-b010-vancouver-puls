@@ -7,6 +7,7 @@ use api::{
     email::{email_error_to_anyhow, EmailDelivery, EmailSendError, EmailService},
     error::ApiError,
     invites::{self, AcceptInviteError, UserInvite},
+    sources::{ContentSource, ContentSourceKind, NewContentSource, UpdateContentSource},
     storage::ObjectStorage,
     users::{User, UserRole},
 };
@@ -89,6 +90,42 @@ struct UserResponse {
 #[derive(Debug, Deserialize)]
 struct UpdateUserRoleRequest {
     role: UserRole,
+}
+
+#[derive(Debug, Serialize)]
+struct SourcesResponse {
+    sources: Vec<SourceResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceResponse {
+    id: i64,
+    name: String,
+    kind: ContentSourceKind,
+    url: Option<String>,
+    external_id: Option<String>,
+    created_by_sub: Option<String>,
+    enabled: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSourceRequest {
+    name: String,
+    kind: ContentSourceKind,
+    url: Option<String>,
+    external_id: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSourceRequest {
+    name: Option<String>,
+    kind: Option<ContentSourceKind>,
+    url: Option<Option<String>>,
+    external_id: Option<Option<String>>,
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +237,11 @@ fn app(
         .route("/api/admin/invites", post(create_invite))
         .route("/api/admin/users", get(list_admin_users))
         .route("/api/admin/users/:sub/role", patch(update_admin_user_role))
+        .route("/api/admin/sources", get(list_sources).post(create_source))
+        .route(
+            "/api/admin/sources/:source_id",
+            patch(update_source).delete(delete_source),
+        )
         .route(
             "/api/invites/accept",
             get(accept_invite_redirect).post(accept_invite),
@@ -335,6 +377,91 @@ async fn update_admin_user_role(
     Ok(Json(UserResponse::from(user)))
 }
 
+async fn list_sources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SourcesResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+
+    let sources = api::sources::list_content_sources(&state.db)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(SourceResponse::from)
+        .collect();
+
+    Ok(Json(SourcesResponse { sources }))
+}
+
+async fn create_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateSourceRequest>,
+) -> Result<Json<SourceResponse>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let source = NewContentSource {
+        name: payload.name,
+        kind: payload.kind,
+        url: payload.url,
+        external_id: payload.external_id,
+        created_by_sub: Some(admin.user.sub),
+    };
+
+    let created = api::sources::create_content_source(&state.db, &source)
+        .await
+        .map_err(source_write_error)?;
+
+    if payload.enabled == Some(false) {
+        let disabled = api::sources::set_content_source_enabled(&state.db, created.id, false)
+            .await
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::internal(anyhow::anyhow!("created source was not found")))?;
+        return Ok(Json(SourceResponse::from(disabled)));
+    }
+
+    Ok(Json(SourceResponse::from(created)))
+}
+
+async fn update_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(source_id): Path<i64>,
+    Json(payload): Json<UpdateSourceRequest>,
+) -> Result<Json<SourceResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+    ensure_positive_source_id(source_id)?;
+
+    let update = UpdateContentSource {
+        name: payload.name,
+        kind: payload.kind,
+        url: payload.url,
+        external_id: payload.external_id,
+        enabled: payload.enabled,
+    };
+    let source = api::sources::update_content_source(&state.db, source_id, &update)
+        .await
+        .map_err(source_write_error)?
+        .ok_or_else(|| ApiError::not_found_message("source was not found"))?;
+
+    Ok(Json(SourceResponse::from(source)))
+}
+
+async fn delete_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(source_id): Path<i64>,
+) -> Result<Json<SourceResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+    ensure_positive_source_id(source_id)?;
+
+    let source = api::sources::delete_content_source(&state.db, source_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("source was not found"))?;
+
+    Ok(Json(SourceResponse::from(source)))
+}
+
 async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -439,6 +566,33 @@ async fn require_admin(
     Ok(authenticated)
 }
 
+fn ensure_positive_source_id(source_id: i64) -> Result<(), ApiError> {
+    if source_id < 1 {
+        return Err(ApiError::bad_request("source id must be positive"));
+    }
+
+    Ok(())
+}
+
+fn source_write_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("source name is required")
+        || message.contains("source url")
+        || message.contains("source url or external id")
+        || message.contains("duplicate key value violates unique constraint")
+        || message.contains("violates check constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    ApiError::internal(error)
+}
+
 async fn send_invite_email(
     state: &AppState,
     email: &str,
@@ -508,6 +662,22 @@ impl From<User> for UserResponse {
             created_at: user.created_at,
             updated_at: user.updated_at,
             last_seen_at: user.last_seen_at,
+        }
+    }
+}
+
+impl From<ContentSource> for SourceResponse {
+    fn from(source: ContentSource) -> Self {
+        Self {
+            id: source.id,
+            name: source.name,
+            kind: source.kind,
+            url: source.url,
+            external_id: source.external_id,
+            created_by_sub: source.created_by_sub,
+            enabled: source.enabled,
+            created_at: source.created_at,
+            updated_at: source.updated_at,
         }
     }
 }

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Type};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +36,15 @@ pub struct NewContentSource {
     pub created_by_sub: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateContentSource {
+    pub name: Option<String>,
+    pub kind: Option<ContentSourceKind>,
+    pub url: Option<Option<String>>,
+    pub external_id: Option<Option<String>>,
+    pub enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
 pub struct IngestedItem {
     pub id: i64,
@@ -65,6 +75,8 @@ pub async fn create_content_source(
     pool: &PgPool,
     source: &NewContentSource,
 ) -> Result<ContentSource> {
+    let normalized = ValidatedContentSourceInput::from_new(source)?;
+
     sqlx::query_as::<_, ContentSource>(
         r#"
         INSERT INTO content_sources (name, kind, url, external_id, created_by_sub)
@@ -72,10 +84,10 @@ pub async fn create_content_source(
         RETURNING id, name, kind, url, external_id, created_by_sub, enabled, created_at, updated_at
         "#,
     )
-    .bind(source.name.trim())
-    .bind(source.kind)
-    .bind(trimmed_optional(source.url.as_deref()))
-    .bind(trimmed_optional(source.external_id.as_deref()))
+    .bind(&normalized.name)
+    .bind(normalized.kind)
+    .bind(&normalized.url)
+    .bind(&normalized.external_id)
     .bind(trimmed_optional(source.created_by_sub.as_deref()))
     .persistent(false)
     .fetch_one(pool)
@@ -97,6 +109,57 @@ pub async fn list_content_sources(pool: &PgPool) -> Result<Vec<ContentSource>> {
     .context("failed to list content sources")
 }
 
+pub async fn find_content_source(pool: &PgPool, source_id: i64) -> Result<Option<ContentSource>> {
+    sqlx::query_as::<_, ContentSource>(
+        r#"
+        SELECT id, name, kind, url, external_id, created_by_sub, enabled, created_at, updated_at
+        FROM content_sources
+        WHERE id = $1
+        "#,
+    )
+    .bind(source_id)
+    .persistent(false)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to find content source `{source_id}`"))
+}
+
+pub async fn update_content_source(
+    pool: &PgPool,
+    source_id: i64,
+    update: &UpdateContentSource,
+) -> Result<Option<ContentSource>> {
+    let existing = find_content_source(pool, source_id).await?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let normalized = ValidatedContentSourceInput::from_update(&existing, update)?;
+
+    sqlx::query_as::<_, ContentSource>(
+        r#"
+        UPDATE content_sources
+        SET
+            name = $2,
+            kind = $3,
+            url = $4,
+            external_id = $5,
+            enabled = $6
+        WHERE id = $1
+        RETURNING id, name, kind, url, external_id, created_by_sub, enabled, created_at, updated_at
+        "#,
+    )
+    .bind(source_id)
+    .bind(&normalized.name)
+    .bind(normalized.kind)
+    .bind(&normalized.url)
+    .bind(&normalized.external_id)
+    .bind(update.enabled.unwrap_or(existing.enabled))
+    .persistent(false)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to update content source `{source_id}`"))
+}
+
 pub async fn set_content_source_enabled(
     pool: &PgPool,
     source_id: i64,
@@ -116,6 +179,21 @@ pub async fn set_content_source_enabled(
     .fetch_optional(pool)
     .await
     .with_context(|| format!("failed to update content source `{source_id}`"))
+}
+
+pub async fn delete_content_source(pool: &PgPool, source_id: i64) -> Result<Option<ContentSource>> {
+    sqlx::query_as::<_, ContentSource>(
+        r#"
+        DELETE FROM content_sources
+        WHERE id = $1
+        RETURNING id, name, kind, url, external_id, created_by_sub, enabled, created_at, updated_at
+        "#,
+    )
+    .bind(source_id)
+    .persistent(false)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to delete content source `{source_id}`"))
 }
 
 pub async fn upsert_ingested_item(pool: &PgPool, item: &NewIngestedItem) -> Result<IngestedItem> {
@@ -237,17 +315,152 @@ fn trimmed_optional(value: Option<&str>) -> Option<String> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedContentSourceInput {
+    name: String,
+    kind: ContentSourceKind,
+    url: Option<String>,
+    external_id: Option<String>,
+}
+
+impl ValidatedContentSourceInput {
+    fn from_new(source: &NewContentSource) -> Result<Self> {
+        validate_source_input(
+            source.name.trim(),
+            source.kind,
+            trimmed_optional(source.url.as_deref()),
+            trimmed_optional(source.external_id.as_deref()),
+        )
+    }
+
+    fn from_update(existing: &ContentSource, update: &UpdateContentSource) -> Result<Self> {
+        validate_source_input(
+            update
+                .name
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or(existing.name.as_str()),
+            update.kind.unwrap_or(existing.kind),
+            match &update.url {
+                Some(value) => trimmed_optional(value.as_deref()),
+                None => existing.url.clone(),
+            },
+            match &update.external_id {
+                Some(value) => trimmed_optional(value.as_deref()),
+                None => existing.external_id.clone(),
+            },
+        )
+    }
+}
+
+fn validate_source_input(
+    name: &str,
+    kind: ContentSourceKind,
+    url: Option<String>,
+    external_id: Option<String>,
+) -> Result<ValidatedContentSourceInput> {
+    if name.is_empty() {
+        anyhow::bail!("source name is required");
+    }
+
+    if let Some(source_url) = &url {
+        let parsed = Url::parse(source_url)
+            .with_context(|| format!("source url `{source_url}` is invalid"))?;
+
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("source url must use http or https");
+        }
+    }
+
+    if url.is_none() && external_id.is_none() {
+        anyhow::bail!("source url or external id is required");
+    }
+
+    Ok(ValidatedContentSourceInput {
+        name: name.to_owned(),
+        kind,
+        url,
+        external_id,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::trimmed_optional;
+    use super::{
+        validate_source_input, ContentSource, ContentSourceKind, UpdateContentSource,
+        ValidatedContentSourceInput,
+    };
+    use chrono::Utc;
 
     #[test]
     fn trimmed_optional_drops_blank_values() {
-        assert_eq!(trimmed_optional(None), None);
-        assert_eq!(trimmed_optional(Some("   ")), None);
+        assert_eq!(super::trimmed_optional(None), None);
+        assert_eq!(super::trimmed_optional(Some("   ")), None);
         assert_eq!(
-            trimmed_optional(Some(" https://example.com ")),
+            super::trimmed_optional(Some(" https://example.com ")),
             Some("https://example.com".to_owned())
         );
+    }
+
+    #[test]
+    fn validate_source_input_requires_http_url_or_external_id() {
+        assert!(validate_source_input("News", ContentSourceKind::Website, None, None).is_err());
+        assert!(validate_source_input(
+            "News",
+            ContentSourceKind::Website,
+            Some("ftp://example.com".to_owned()),
+            None
+        )
+        .is_err());
+        let validated = match validate_source_input(
+            "News",
+            ContentSourceKind::Website,
+            Some("https://example.com".to_owned()),
+            None,
+        ) {
+            Ok(validated) => validated,
+            Err(error) => panic!("valid source was rejected: {error}"),
+        };
+
+        assert_eq!(
+            validated,
+            ValidatedContentSourceInput {
+                name: "News".to_owned(),
+                kind: ContentSourceKind::Website,
+                url: Some("https://example.com".to_owned()),
+                external_id: None
+            }
+        );
+    }
+
+    #[test]
+    fn update_input_preserves_existing_values() {
+        let existing = ContentSource {
+            id: 1,
+            name: "Events".to_owned(),
+            kind: ContentSourceKind::Rss,
+            url: Some("https://example.com/rss".to_owned()),
+            external_id: None,
+            created_by_sub: None,
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let update = UpdateContentSource {
+            name: Some("Event feed".to_owned()),
+            kind: None,
+            url: None,
+            external_id: None,
+            enabled: Some(false),
+        };
+
+        let normalized = match ValidatedContentSourceInput::from_update(&existing, &update) {
+            Ok(normalized) => normalized,
+            Err(error) => panic!("valid update was rejected: {error}"),
+        };
+
+        assert_eq!(normalized.name, "Event feed");
+        assert_eq!(normalized.kind, ContentSourceKind::Rss);
+        assert_eq!(normalized.url, Some("https://example.com/rss".to_owned()));
     }
 }

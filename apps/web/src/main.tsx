@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./App";
+import { AuthProvider } from "./auth/AuthContext";
 import "./index.css";
 import { queryClient } from "./queryClient";
 
@@ -14,7 +15,9 @@ if (!root) {
 ReactDOM.createRoot(root).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AuthProvider>
+        <App />
+      </AuthProvider>
     </QueryClientProvider>
   </React.StrictMode>,
 );

@@ -1,0 +1,67 @@
+Architecture plan for Vancouver Puls
+
+Scope
+- Build a self-hosted content operations product for source ingestion, bilingual draft generation, approval, scheduling, Instagram publishing, and performance insights.
+- Implement the 39 GitHub issues incrementally, with each issue landing a focused vertical slice or foundation piece.
+
+Monorepo structure
+- apps/web: React + TypeScript + Vite frontend.
+  - src/app: router, providers, layouts, auth context.
+  - src/features/auth: login, session state, role-aware UI.
+  - src/features/admin: user and role management.
+  - src/features/sources: source management and ingested item inbox.
+  - src/features/drafts: draft editor, approval controls, asset/layout preview.
+  - src/features/calendar: calendar, scheduler, fill-slot flows.
+  - src/features/instagram: connection settings and publish status.
+  - src/features/insights: performance dashboards.
+  - src/lib/api: typed API client, auth token handling, error normalization.
+  - src/lib/types: frontend-facing shared DTOs generated from or mirrored with backend contracts.
+  - src/components: reusable UI primitives and app shell components.
+- apps/api: Rust Axum backend.
+  - src/main.rs: bootstrapping, config loading, tracing, graceful shutdown.
+  - src/http: router composition, middleware, extractors, error responses.
+  - src/modules/auth: password hashing, JWT issuance, login, auth guard, role guard.
+  - src/modules/users: user and role CRUD/invite support.
+  - src/modules/sources: source CRUD, ingestion configuration.
+  - src/modules/ingestion: scheduled fetch jobs, deduplication, normalized ingested items.
+  - src/modules/drafts: draft models, generation/edit APIs, approval workflow.
+  - src/modules/rendering: on-brand layout and asset rendering.
+  - src/modules/schedule: schedule models, calendar APIs, backup-library slot filling.
+  - src/modules/instagram: connection/settings, Graph API publish service, publish logs.
+  - src/modules/insights: insights pull service and snapshots.
+  - src/db: database pool, migrations, repository helpers.
+  - src/config: environment parsing and typed application settings.
+  - src/jobs: scheduler runner, retries, background workers.
+  - src/integrations: Resend, Claude, object storage, Instagram Graph API clients.
+  - src/shared: DTOs, domain IDs, timestamps, pagination, validation helpers.
+- packages/contracts: optional shared API schema artifacts if OpenAPI/TypeScript generation is introduced.
+- migrations: SQL migrations for PostgreSQL, ordered by issue/domain.
+- infra: deployment notes, Dockerfile, compose files, reverse-proxy/CORS notes, operational scripts.
+- e2e: end-to-end tests for the core flow once main features exist.
+
+Shared types and API contracts
+- Keep backend domain models separate from HTTP DTOs to avoid leaking persistence details.
+- Use stable DTO structs in Rust with serde and expose an OpenAPI document or generated TypeScript types once API shape settles.
+- Standardize API responses around typed success payloads and a consistent error body with code, message, and optional details.
+- Use UUID primary IDs, timestamptz fields, and explicit status enums for drafts, schedules, publishing, and ingestion state.
+
+Issue dependencies
+- Foundation: #1 initializes the monorepo; #2 adds linting/formatting/TypeScript; #3 adds PostgreSQL and migrations; #4 adds typed environment config; #5 adds object storage.
+- API/frontend base: #6 depends on #1-#4; #7 depends on #1, #2, and #6.
+- Authentication/admin: #8 depends on #3; #9 depends on #4 and #8; #10 depends on #9; #11 depends on #10; #12 depends on #8, #9, and #11 plus Resend config; #13 depends on #6, #7, and #10; #14 depends on #11-#13.
+- Sources/ingestion: #15 depends on #3 and #8; #16 depends on #11 and #15; #17 depends on #4, #15, and #16; #18 depends on #15 and #17; #19 depends on #7, #13, and #16; #20 depends on #15-#19.
+- Drafting/rendering: #21 depends on #3, #8, and #15; #22 depends on #4 and #21; #23 depends on #11, #21, and #22; #24 depends on #5 and #21-#23; #25 depends on #7, #13, #20, and #23; #26 depends on #21, #23, and #25.
+- Scheduling/library: #27 depends on #21 and #26; #28 depends on #7, #25, and #27; #29 depends on #3 and #27; #30 depends on #28 and #29.
+- Instagram/publishing: #31 depends on #3, #4, and #11; #32 depends on #7, #13, and #31; #33 depends on #24, #27, and #31; #34 depends on #33 and should reuse shared retry/error primitives.
+- Insights/quality/deploy: #35 depends on #31 and #33; #36 depends on #35; #37 depends on the auth, ingestion, draft, schedule, and publishing slices; #38 depends on implemented integrations/jobs; #39 depends on the production app shape after #37 and #38.
+
+Key design decisions
+- Use a Vite React app rather than SSR initially; the product is an authenticated operations UI where client-side routing is sufficient and simpler to deploy behind the Ideavibes proxy.
+- Use Axum with sqlx for async PostgreSQL access, compile-time checked queries where practical, and SQL migrations committed to the repo.
+- Keep background jobs inside the API binary first, guarded by environment configuration, so early deployment is simple; extract workers only if concurrency or operational needs justify it.
+- Store external integration credentials encrypted or scoped by environment wherever possible; never commit real secrets.
+- Use the platform-provided public origin via ALLOWED_CORS_ORIGIN or forwarded host/proto headers for CORS and generated URLs.
+- Model retryable integration failures explicitly with attempt counts, next_run_at, last_error, and terminal failure states.
+- Treat publishing as an auditable workflow: approved drafts become scheduled items, scheduled items produce publish logs, insights attach to published content.
+- Use object storage for rendered assets and source media, while keeping metadata and workflow state in PostgreSQL.
+- Prefer feature folders in the frontend so each issue can add a coherent UI/API slice without broad cross-app rewrites.

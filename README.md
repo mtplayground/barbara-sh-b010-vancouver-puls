@@ -44,6 +44,10 @@ The backend exposes:
 - `GET /api/health`
 - `GET /api/health/db`
 - `GET /api/health/storage`
+- `GET /api/auth/login` redirects to the managed Ideavibes auth service with
+  a frontend `return_to` URL.
+- `GET /api/auth/session` verifies the `mctai_session` cookie, upserts the user
+  in PostgreSQL, and returns the current app user without issuing an app JWT.
 
 API responses use JSON error bodies shaped as
 `{"error":{"code":"...","message":"..."}}`. The server enables request logging

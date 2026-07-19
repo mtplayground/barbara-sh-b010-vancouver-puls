@@ -6,6 +6,7 @@ use api::{
     db,
     email::{email_error_to_anyhow, EmailDelivery, EmailSendError, EmailService},
     error::ApiError,
+    ingestion,
     invites::{self, AcceptInviteError, UserInvite},
     sources::{ContentSource, ContentSourceKind, NewContentSource, UpdateContentSource},
     storage::ObjectStorage,
@@ -196,6 +197,9 @@ async fn main() -> Result<()> {
         info!("database migrations completed");
         return Ok(());
     }
+
+    let _ingestion_job = ingestion::spawn_ingestion_job(pool.clone(), storage.clone())
+        .context("failed to start scheduled ingestion job")?;
 
     let bind_addr = config.server.bind_addr()?;
     let listener = TcpListener::bind(bind_addr)

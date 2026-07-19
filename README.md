@@ -30,13 +30,20 @@ npm run dev:web
 Run the backend service:
 
 ```bash
-HOST=0.0.0.0 PORT=8080 cargo run -p api
+DATABASE_URL=postgres://... HOST=0.0.0.0 PORT=8080 cargo run -p api
 ```
 
 The backend exposes:
 
 - `GET /healthz`
 - `GET /api/health`
+- `GET /api/health/db`
+
+Run database migrations against the configured PostgreSQL database:
+
+```bash
+DATABASE_URL=postgres://... npm run db:migrate
+```
 
 Build the frontend:
 

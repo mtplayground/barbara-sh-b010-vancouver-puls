@@ -1,13 +1,21 @@
 mod config;
+mod db;
 
 use anyhow::{Context, Result};
-use axum::{routing::get, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use config::AppConfig;
 use serde::Serialize;
+use sqlx::PgPool;
+use std::env;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+#[derive(Clone)]
+struct AppState {
+    db: PgPool,
+}
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -15,11 +23,31 @@ struct HealthResponse {
     service: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct DatabaseHealthResponse {
+    status: &'static str,
+    database: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    code: &'static str,
+    message: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
     let config = AppConfig::from_env()?;
+    let pool = db::connect(&config).await?;
+    db::migrate(&pool).await?;
+
+    if env::args().nth(1).as_deref() == Some("migrate") {
+        info!("database migrations completed");
+        return Ok(());
+    }
+
     let bind_addr = config.bind_addr()?;
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -27,7 +55,7 @@ async fn main() -> Result<()> {
 
     info!("api listening on {bind_addr}");
 
-    axum::serve(listener, app())
+    axum::serve(listener, app(pool))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("api server failed")?;
@@ -35,11 +63,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn app() -> Router {
+fn app(pool: PgPool) -> Router {
+    let state = AppState { db: pool };
+
     Router::new()
         .route("/healthz", get(health))
         .route("/api/health", get(health))
+        .route("/api/health/db", get(database_health))
         .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -47,6 +79,29 @@ async fn health() -> Json<HealthResponse> {
         status: "ok",
         service: "api",
     })
+}
+
+async fn database_health(
+    State(state): State<AppState>,
+) -> Result<Json<DatabaseHealthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    db::ping(&state.db).await.map_err(internal_error)?;
+
+    Ok(Json(DatabaseHealthResponse {
+        status: "ok",
+        database: "postgres",
+    }))
+}
+
+fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    tracing::error!(error = ?error, "request failed");
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            code: "internal_error",
+            message: "request failed".to_owned(),
+        }),
+    )
 }
 
 fn init_tracing() {

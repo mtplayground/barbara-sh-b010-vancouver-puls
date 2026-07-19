@@ -1,5 +1,6 @@
 import type {
   ApiErrorPayload,
+  AuthSessionResponse,
   DatabaseHealthResponse,
   HealthResponse,
   StorageHealthResponse,
@@ -23,6 +24,8 @@ export const apiClient = {
   getHealth: () => request<HealthResponse>("/api/health"),
   getDatabaseHealth: () => request<DatabaseHealthResponse>("/api/health/db"),
   getStorageHealth: () => request<StorageHealthResponse>("/api/health/storage"),
+  getAuthSession: () => request<AuthSessionResponse>("/api/auth/session"),
+  getLoginUrl: () => apiUrl("/api/auth/login"),
 };
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {

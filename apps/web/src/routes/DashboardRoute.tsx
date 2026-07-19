@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { apiClient } from "../api/client";
 import type { StorageHealthResponse } from "../api/types";
 import { useAuth } from "../auth/useAuth";
+import { LoginRoute } from "./LoginRoute";
 
 export function DashboardRoute() {
   const auth = useAuth();
@@ -19,14 +20,29 @@ export function DashboardRoute() {
     queryFn: apiClient.getStorageHealth,
   });
 
+  if (auth.status === "unknown") {
+    return (
+      <section className="bg-white px-5 py-5 shadow-sm">
+        <p className="text-pine text-sm font-semibold uppercase tracking-wide">Session</p>
+        <h2 className="mt-2 text-2xl font-semibold tracking-normal">Checking your session</h2>
+      </section>
+    );
+  }
+
+  if (!auth.isAuthenticated) {
+    return <LoginRoute />;
+  }
+
   return (
     <div className="space-y-6">
       <section className="bg-white px-5 py-5 shadow-sm">
         <p className="text-pine text-sm font-semibold uppercase tracking-wide">Overview</p>
-        <h2 className="mt-2 text-3xl font-semibold tracking-normal">Workspace dashboard</h2>
+        <h2 className="mt-2 text-3xl font-semibold tracking-normal">
+          Welcome back{auth.user?.name ? `, ${auth.user.name}` : ""}
+        </h2>
         <p className="mt-3 max-w-3xl text-base leading-7 text-slate-700">
-          Routing, navigation, API status checks, and auth state scaffolding are ready for the
-          feature slices that follow.
+          Monitor service readiness and continue managing sources, drafts, scheduling, and
+          publishing operations.
         </p>
       </section>
 
@@ -58,12 +74,12 @@ export function DashboardRoute() {
         <SummaryPanel
           label="Current auth state"
           value={auth.status}
-          detail="Session loading will be wired by the auth task."
+          detail={auth.user?.email ?? "Signed in through managed workspace authentication."}
         />
         <SummaryPanel
           label="Assigned roles"
           value={auth.roles.length > 0 ? auth.roles.join(", ") : "none"}
-          detail="Role data is reserved for the user-management workflow."
+          detail="Permissions are applied by the backend on protected operations."
         />
       </section>
     </div>

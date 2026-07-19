@@ -4,6 +4,7 @@ import type { AuthSnapshot } from "./types";
 
 export interface AuthContextValue extends AuthSnapshot {
   isAuthenticated: boolean;
+  signIn: () => void;
   setAuthSnapshot: (snapshot: AuthSnapshot) => void;
   resetAuth: () => void;
 }

@@ -5,12 +5,14 @@ import { CalendarRoute } from "./CalendarRoute";
 import { DashboardRoute } from "./DashboardRoute";
 import { DraftsRoute } from "./DraftsRoute";
 import { InboxRoute } from "./InboxRoute";
+import { LoginRoute } from "./LoginRoute";
 import { SettingsRoute } from "./SettingsRoute";
 import { SourcesRoute } from "./SourcesRoute";
 
 export function AppRoutes() {
   return (
     <Routes>
+      <Route path="login" element={<LoginRoute />} />
       <Route element={<AppLayout />}>
         <Route index element={<DashboardRoute />} />
         <Route path="sources" element={<SourcesRoute />} />

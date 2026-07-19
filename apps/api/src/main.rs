@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use api::{config::AppConfig, db, storage::ObjectStorage};
-use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
+use api::{config::AppConfig, cors::cors_layer, db, error::ApiError, storage::ObjectStorage};
+use axum::{extract::State, routing::get, Json, Router};
 use serde::Serialize;
 use sqlx::PgPool;
 use std::env;
 use tokio::net::TcpListener;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -35,12 +35,6 @@ struct StorageHealthResponse {
     prefix: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    code: &'static str,
-    message: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -68,7 +62,7 @@ async fn main() -> Result<()> {
 
     info!("api listening on {bind_addr}");
 
-    axum::serve(listener, app(pool, storage))
+    axum::serve(listener, app(pool, storage, config))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("api server failed")?;
@@ -76,7 +70,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn app(pool: PgPool, storage: Option<ObjectStorage>) -> Router {
+fn app(pool: PgPool, storage: Option<ObjectStorage>, config: AppConfig) -> Router {
     let state = AppState { db: pool, storage };
 
     Router::new()
@@ -84,7 +78,13 @@ fn app(pool: PgPool, storage: Option<ObjectStorage>) -> Router {
         .route("/api/health", get(health))
         .route("/api/health/db", get(database_health))
         .route("/api/health/storage", get(storage_health))
-        .layer(TraceLayer::new_for_http())
+        .fallback(api_not_found)
+        .layer(cors_layer(&config.server))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().include_headers(true))
+                .on_response(DefaultOnResponse::new().include_headers(true)),
+        )
         .with_state(state)
 }
 
@@ -97,8 +97,8 @@ async fn health() -> Json<HealthResponse> {
 
 async fn database_health(
     State(state): State<AppState>,
-) -> Result<Json<DatabaseHealthResponse>, (StatusCode, Json<ErrorResponse>)> {
-    db::ping(&state.db).await.map_err(internal_error)?;
+) -> Result<Json<DatabaseHealthResponse>, ApiError> {
+    db::ping(&state.db).await.map_err(ApiError::internal)?;
 
     Ok(Json(DatabaseHealthResponse {
         status: "ok",
@@ -108,7 +108,7 @@ async fn database_health(
 
 async fn storage_health(
     State(state): State<AppState>,
-) -> Result<Json<StorageHealthResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<StorageHealthResponse>, ApiError> {
     let Some(storage) = state.storage else {
         return Ok(Json(StorageHealthResponse {
             status: "disabled",
@@ -118,7 +118,7 @@ async fn storage_health(
         }));
     };
 
-    storage.check_bucket().await.map_err(internal_error)?;
+    storage.check_bucket().await.map_err(ApiError::internal)?;
 
     Ok(Json(StorageHealthResponse {
         status: "ok",
@@ -128,16 +128,8 @@ async fn storage_health(
     }))
 }
 
-fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
-    tracing::error!(error = ?error, "request failed");
-
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            code: "internal_error",
-            message: "request failed".to_owned(),
-        }),
-    )
+async fn api_not_found() -> ApiError {
+    ApiError::not_found()
 }
 
 fn init_tracing() {

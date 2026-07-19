@@ -23,6 +23,8 @@ npm install
 
 Copy `.env.example` for local development and fill in real values outside of
 version control. The API reads configuration from environment variables only.
+Set `VITE_API_BASE_URL` for the web dev server when it should call an API origin
+other than the same host.
 
 Run the frontend dev server:
 
@@ -42,6 +44,10 @@ The backend exposes:
 - `GET /api/health`
 - `GET /api/health/db`
 - `GET /api/health/storage`
+
+API responses use JSON error bodies shaped as
+`{"error":{"code":"...","message":"..."}}`. The server enables request logging
+and CORS for configured deployment origins plus localhost development origins.
 
 Run database migrations against the configured PostgreSQL database:
 

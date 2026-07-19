@@ -4,6 +4,7 @@ pub mod cors;
 pub mod db;
 pub mod email;
 pub mod error;
+pub mod ingestion;
 pub mod invites;
 pub mod sources;
 pub mod storage;

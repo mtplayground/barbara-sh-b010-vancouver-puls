@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
@@ -24,6 +24,7 @@ pub struct IngestionRunSummary {
     pub sources_polled: usize,
     pub items_seen: usize,
     pub items_queued: usize,
+    pub items_deduplicated: usize,
     pub media_cached: usize,
 }
 
@@ -67,6 +68,7 @@ impl IngestionService {
             sources_polled: 0,
             items_seen: 0,
             items_queued: 0,
+            items_deduplicated: 0,
             media_cached: 0,
         };
 
@@ -76,6 +78,7 @@ impl IngestionService {
                     summary.sources_polled += 1;
                     summary.items_seen += source_summary.items_seen;
                     summary.items_queued += source_summary.items_queued;
+                    summary.items_deduplicated += source_summary.items_deduplicated;
                     summary.media_cached += source_summary.media_cached;
                 }
                 Err(error) => {
@@ -124,10 +127,21 @@ impl IngestionService {
             sources_polled: 1,
             items_seen: normalized_items.len(),
             items_queued: 0,
+            items_deduplicated: 0,
             media_cached: 0,
         };
+        let mut seen_dedup_keys = HashSet::new();
 
         for normalized in normalized_items {
+            if !seen_dedup_keys.insert(normalized.dedup_key.clone())
+                || self
+                    .is_duplicate_topic(source.id, &normalized.dedup_key)
+                    .await?
+            {
+                summary.items_deduplicated += 1;
+                continue;
+            }
+
             let (media_ref, cached) = self.cache_media_if_available(source.id, &normalized).await;
             if cached {
                 summary.media_cached += 1;
@@ -148,6 +162,13 @@ impl IngestionService {
         }
 
         Ok(summary)
+    }
+
+    async fn is_duplicate_topic(&self, source_id: i64, dedup_key: &str) -> Result<bool> {
+        let existing =
+            sources::find_ingested_item_by_dedup_key_any_source(&self.pool, dedup_key).await?;
+
+        Ok(existing.is_some_and(|item| item.source_id != source_id))
     }
 
     async fn fetch_text(&self, url: &str) -> Result<String> {
@@ -252,6 +273,7 @@ pub fn spawn_ingestion_job(pool: PgPool, storage: Option<ObjectStorage>) -> Resu
                         sources_polled = summary.sources_polled,
                         items_seen = summary.items_seen,
                         items_queued = summary.items_queued,
+                        items_deduplicated = summary.items_deduplicated,
                         media_cached = summary.media_cached,
                         "scheduled ingestion run completed"
                     );
@@ -303,19 +325,21 @@ fn normalize_feed_block(
         .or_else(|| first_attribute(block, "link", "href"))
         .unwrap_or_else(|| source_url.to_owned());
     let summary = first_tag_text(block, &["description", "summary", "content"]);
-    let identity = first_tag_text(block, &["guid", "id"]).unwrap_or_else(|| link.clone());
     let media_url = first_attribute(block, "enclosure", "url")
         .or_else(|| first_attribute(block, "media:content", "url"))
         .or_else(|| first_attribute(block, "media:thumbnail", "url"));
+    let link = trim_to_non_empty(&resolve_url(source_url, &link))?;
+    let summary = summary.and_then(|value| trim_to_non_empty(&value));
+    let title = trim_to_non_empty(&title)?;
 
     Some(NormalizedSourceItem {
-        title: trim_to_non_empty(&title)?,
-        summary: summary.and_then(|value| trim_to_non_empty(&value)),
-        link: trim_to_non_empty(&resolve_url(source_url, &link))?,
+        dedup_key: topic_dedup_key(&title, &link, summary.as_deref()),
+        title,
+        summary,
+        link,
         media_url: media_url
             .and_then(|value| trim_to_non_empty(&value))
             .map(|value| resolve_url(source_url, &value)),
-        dedup_key: digest_key(&format!("{}:{}", source.id, identity)),
         source_published_at: None,
     })
 }
@@ -333,13 +357,14 @@ fn normalize_website_item(
     let media_url = html_meta_property(body, "og:image")
         .and_then(|value| trim_to_non_empty(&value))
         .map(|value| resolve_url(source_url, &value));
+    let dedup_key = topic_dedup_key(&title, source_url, summary.as_deref());
 
     NormalizedSourceItem {
         title,
         summary,
         link: source_url.to_owned(),
         media_url,
-        dedup_key: digest_key(&format!("{}:{}", source.id, source_url)),
+        dedup_key,
         source_published_at: None,
     }
 }
@@ -471,6 +496,57 @@ fn trim_to_non_empty(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+fn topic_dedup_key(title: &str, link: &str, summary: Option<&str>) -> String {
+    let topic = normalize_topic_text(title);
+
+    if topic.len() >= 12 {
+        return digest_key(&format!("topic:{topic}"));
+    }
+
+    let canonical_link = canonicalize_url(link);
+    let fallback = summary
+        .map(normalize_topic_text)
+        .filter(|value| value.len() >= 12)
+        .unwrap_or(canonical_link);
+
+    digest_key(&format!("item:{fallback}"))
+}
+
+fn normalize_topic_text(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut previous_was_space = true;
+
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character);
+            previous_was_space = false;
+        } else if !previous_was_space {
+            normalized.push(' ');
+            previous_was_space = true;
+        }
+    }
+
+    normalized.trim().to_owned()
+}
+
+fn canonicalize_url(value: &str) -> String {
+    let Ok(mut url) = Url::parse(value) else {
+        return normalize_topic_text(value);
+    };
+
+    url.set_query(None);
+    url.set_fragment(None);
+    let host = url.host_str().map(str::to_ascii_lowercase);
+
+    if let Some(host) = host {
+        let _ = url.set_host(Some(&host));
+    }
+
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    url.to_string()
+}
+
 fn resolve_url(base_url: &str, candidate: &str) -> String {
     if Url::parse(candidate).is_ok() {
         return candidate.to_owned();
@@ -508,13 +584,17 @@ fn empty_polled_summary() -> IngestionRunSummary {
         sources_polled: 1,
         items_seen: 0,
         items_queued: 0,
+        items_deduplicated: 0,
         media_cached: 0,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_blocks, html_meta_property, normalize_feed_items, normalize_website_item};
+    use super::{
+        extract_blocks, html_meta_property, normalize_feed_items, normalize_website_item,
+        topic_dedup_key,
+    };
     use crate::sources::{ContentSource, ContentSourceKind};
     use chrono::Utc;
 
@@ -590,6 +670,34 @@ mod tests {
             ),
             Some("https://example.com/image.jpg".to_owned())
         );
+    }
+
+    #[test]
+    fn topic_dedup_key_collapses_same_title_across_links() {
+        let first = topic_dedup_key(
+            "Vancouver Night Market",
+            "https://events.example.com/night-market?utm_source=feed",
+            None,
+        );
+        let second = topic_dedup_key(
+            "vancouver night market!",
+            "https://other.example.com/story/123",
+            None,
+        );
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn topic_dedup_key_canonicalizes_tracking_urls_for_short_titles() {
+        let first = topic_dedup_key(
+            "BC",
+            "https://news.example.com/story?utm_campaign=social#comments",
+            None,
+        );
+        let second = topic_dedup_key("BC", "https://news.example.com/story", None);
+
+        assert_eq!(first, second);
     }
 
     fn test_source(kind: ContentSourceKind) -> ContentSource {

@@ -8,6 +8,7 @@ import { InboxRoute } from "./InboxRoute";
 import { LoginRoute } from "./LoginRoute";
 import { SettingsRoute } from "./SettingsRoute";
 import { SourcesRoute } from "./SourcesRoute";
+import { UsersRoute } from "./UsersRoute";
 
 export function AppRoutes() {
   return (
@@ -19,6 +20,7 @@ export function AppRoutes() {
         <Route path="inbox" element={<InboxRoute />} />
         <Route path="drafts" element={<DraftsRoute />} />
         <Route path="calendar" element={<CalendarRoute />} />
+        <Route path="users" element={<UsersRoute />} />
         <Route path="settings" element={<SettingsRoute />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

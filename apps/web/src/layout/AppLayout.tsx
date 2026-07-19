@@ -8,12 +8,16 @@ const navigationItems = [
   { label: "Inbox", to: "/inbox" },
   { label: "Drafts", to: "/drafts" },
   { label: "Calendar", to: "/calendar" },
+  { label: "Users", to: "/users", adminOnly: true },
   { label: "Settings", to: "/settings" },
 ];
 
 export function AppLayout() {
   const auth = useAuth();
   const displayName = auth.user?.name ?? auth.user?.email;
+  const visibleNavigationItems = navigationItems.filter(
+    (item) => !item.adminOnly || auth.roles.includes("admin"),
+  );
 
   if (auth.status === "anonymous") {
     return <Outlet />;
@@ -60,7 +64,7 @@ export function AppLayout() {
       <div className="mx-auto grid w-full max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[220px_minmax(0,1fr)]">
         <nav aria-label="Primary" className="lg:sticky lg:top-6 lg:self-start">
           <div className="flex gap-2 overflow-x-auto border-b border-slate-200 pb-3 lg:flex-col lg:border-b-0 lg:pb-0">
-            {navigationItems.map((item) => (
+            {visibleNavigationItems.map((item) => (
               <NavLink
                 key={item.to}
                 to={item.to}

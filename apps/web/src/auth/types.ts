@@ -7,7 +7,7 @@ export interface AuthUser {
   pictureUrl: string | null;
 }
 
-export type UserRole = "admin" | "editor" | "viewer";
+export type UserRole = "admin" | "editor";
 
 export interface AuthSnapshot {
   status: AuthStatus;

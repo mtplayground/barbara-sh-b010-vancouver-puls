@@ -13,6 +13,11 @@ const navigationItems = [
 
 export function AppLayout() {
   const auth = useAuth();
+  const displayName = auth.user?.name ?? auth.user?.email;
+
+  if (auth.status === "anonymous") {
+    return <Outlet />;
+  }
 
   return (
     <div className="bg-paper min-h-screen text-slate-950">
@@ -25,9 +30,29 @@ export function AppLayout() {
             <h1 className="mt-1 text-2xl font-semibold tracking-normal">Publishing operations</h1>
           </div>
           <div className="flex items-center gap-3 text-sm">
-            <span className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 font-medium text-slate-700">
-              Auth: {auth.status}
-            </span>
+            {auth.isAuthenticated ? (
+              <div className="flex items-center gap-3">
+                {auth.user?.pictureUrl ? (
+                  <img
+                    src={auth.user.pictureUrl}
+                    alt=""
+                    className="h-9 w-9 rounded-full border border-slate-200"
+                  />
+                ) : null}
+                <div className="text-right">
+                  <p className="font-semibold text-slate-950">{displayName}</p>
+                  <p className="text-xs uppercase text-slate-500">{auth.roles.join(", ")}</p>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={auth.signIn}
+                className="bg-pine hover:bg-pine/90 focus-visible:ring-coral px-4 py-2 font-semibold text-white shadow-sm focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2"
+              >
+                Sign in
+              </button>
+            )}
           </div>
         </div>
       </header>

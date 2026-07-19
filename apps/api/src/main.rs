@@ -1,9 +1,6 @@
-mod config;
-mod db;
-
 use anyhow::{Context, Result};
+use api::{config::AppConfig, db, storage::ObjectStorage};
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
-use config::AppConfig;
 use serde::Serialize;
 use sqlx::PgPool;
 use std::env;
@@ -15,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
+    storage: Option<ObjectStorage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -30,6 +28,14 @@ struct DatabaseHealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct StorageHealthResponse {
+    status: &'static str,
+    storage: &'static str,
+    bucket: Option<String>,
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     code: &'static str,
     message: String,
@@ -41,6 +47,12 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::from_env()?;
     config.log_summary();
+    let storage = match &config.object_storage {
+        Some(object_storage_config) => {
+            Some(ObjectStorage::from_config(object_storage_config).await?)
+        }
+        None => None,
+    };
     let pool = db::connect(&config).await?;
     db::migrate(&pool).await?;
 
@@ -56,7 +68,7 @@ async fn main() -> Result<()> {
 
     info!("api listening on {bind_addr}");
 
-    axum::serve(listener, app(pool))
+    axum::serve(listener, app(pool, storage))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("api server failed")?;
@@ -64,13 +76,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn app(pool: PgPool) -> Router {
-    let state = AppState { db: pool };
+fn app(pool: PgPool, storage: Option<ObjectStorage>) -> Router {
+    let state = AppState { db: pool, storage };
 
     Router::new()
         .route("/healthz", get(health))
         .route("/api/health", get(health))
         .route("/api/health/db", get(database_health))
+        .route("/api/health/storage", get(storage_health))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -90,6 +103,28 @@ async fn database_health(
     Ok(Json(DatabaseHealthResponse {
         status: "ok",
         database: "postgres",
+    }))
+}
+
+async fn storage_health(
+    State(state): State<AppState>,
+) -> Result<Json<StorageHealthResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let Some(storage) = state.storage else {
+        return Ok(Json(StorageHealthResponse {
+            status: "disabled",
+            storage: "s3",
+            bucket: None,
+            prefix: None,
+        }));
+    };
+
+    storage.check_bucket().await.map_err(internal_error)?;
+
+    Ok(Json(StorageHealthResponse {
+        status: "ok",
+        storage: "s3",
+        bucket: Some(storage.bucket().to_owned()),
+        prefix: Some(storage.prefix().to_owned()),
     }))
 }
 

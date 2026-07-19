@@ -41,6 +41,7 @@ The backend exposes:
 - `GET /healthz`
 - `GET /api/health`
 - `GET /api/health/db`
+- `GET /api/health/storage`
 
 Run database migrations against the configured PostgreSQL database:
 

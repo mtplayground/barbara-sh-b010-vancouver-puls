@@ -21,6 +21,9 @@ Install frontend dependencies:
 npm install
 ```
 
+Copy `.env.example` for local development and fill in real values outside of
+version control. The API reads configuration from environment variables only.
+
 Run the frontend dev server:
 
 ```bash

@@ -3,10 +3,14 @@ import type {
   AdminUserResponse,
   AdminUsersResponse,
   AuthSessionResponse,
+  CreateSourceRequest,
   CreateInviteResponse,
   DatabaseHealthResponse,
   HealthResponse,
+  SourceResponse,
+  SourcesResponse,
   StorageHealthResponse,
+  UpdateSourceRequest,
   UserRole,
 } from "./types";
 
@@ -46,6 +50,27 @@ export const apiClient = {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ role }),
+    }),
+  listSources: () => request<SourcesResponse>("/api/admin/sources"),
+  createSource: (source: CreateSourceRequest) =>
+    request<SourceResponse>("/api/admin/sources", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(source),
+    }),
+  updateSource: (id: number, source: UpdateSourceRequest) =>
+    request<SourceResponse>(`/api/admin/sources/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(source),
+    }),
+  deleteSource: (id: number) =>
+    request<SourceResponse>(`/api/admin/sources/${encodeURIComponent(id)}`, {
+      method: "DELETE",
     }),
 };
 

@@ -16,6 +16,7 @@ export interface StorageHealthResponse {
 }
 
 export type UserRole = "admin" | "editor";
+export type ContentSourceKind = "rss" | "website" | "instagram" | "manual";
 
 export interface AuthSessionUserResponse {
   sub: string;
@@ -62,6 +63,38 @@ export interface CreateInviteResponse {
   invite: InviteResponse;
   invite_url: string;
   email_delivery: InviteEmailDelivery;
+}
+
+export interface SourceResponse {
+  id: number;
+  name: string;
+  kind: ContentSourceKind;
+  url: string | null;
+  external_id: string | null;
+  created_by_sub: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SourcesResponse {
+  sources: SourceResponse[];
+}
+
+export interface CreateSourceRequest {
+  name: string;
+  kind: ContentSourceKind;
+  url?: string | null;
+  external_id?: string | null;
+  enabled?: boolean;
+}
+
+export interface UpdateSourceRequest {
+  name?: string;
+  kind?: ContentSourceKind;
+  url?: string | null;
+  external_id?: string | null;
+  enabled?: boolean;
 }
 
 export interface ApiErrorPayload {

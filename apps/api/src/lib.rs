@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup_library;
 pub mod claude;
 pub mod config;
 pub mod cors;

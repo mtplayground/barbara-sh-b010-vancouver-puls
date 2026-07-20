@@ -3,14 +3,20 @@ import type {
   AdminUserResponse,
   AdminUsersResponse,
   AuthSessionResponse,
+  CreateDraftRequest,
   CreateSourceRequest,
   CreateInviteResponse,
   DatabaseHealthResponse,
+  DraftResponse,
+  DraftsResponse,
   HealthResponse,
   InboxItemsResponse,
+  RegenerateDraftRequest,
+  RenderDraftResponse,
   SourceResponse,
   SourcesResponse,
   StorageHealthResponse,
+  UpdateDraftRequest,
   UpdateSourceRequest,
   UserRole,
 } from "./types";
@@ -75,6 +81,37 @@ export const apiClient = {
     }),
   listInboxItems: (limit = 50) =>
     request<InboxItemsResponse>(`/api/inbox/items?limit=${encodeURIComponent(limit)}`),
+  listDrafts: (limit = 50) =>
+    request<DraftsResponse>(`/api/drafts?limit=${encodeURIComponent(limit)}`),
+  getDraft: (id: number) => request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}`),
+  createDraft: (draft: CreateDraftRequest) =>
+    request<DraftResponse>("/api/drafts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(draft),
+    }),
+  updateDraft: (id: number, draft: UpdateDraftRequest) =>
+    request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(draft),
+    }),
+  regenerateDraft: (id: number, draft: RegenerateDraftRequest = {}) =>
+    request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}/regenerate`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(draft),
+    }),
+  renderDraft: (id: number) =>
+    request<RenderDraftResponse>(`/api/drafts/${encodeURIComponent(id)}/render`, {
+      method: "POST",
+    }),
 };
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {

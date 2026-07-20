@@ -100,6 +100,14 @@ export const apiClient = {
       },
       body: JSON.stringify(draft),
     }),
+  approveDraft: (id: number) =>
+    request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+    }),
+  rejectDraft: (id: number) =>
+    request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}/reject`, {
+      method: "POST",
+    }),
   regenerateDraft: (id: number, draft: RegenerateDraftRequest = {}) =>
     request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}/regenerate`, {
       method: "POST",

@@ -342,6 +342,8 @@ fn app(
         .route("/api/inbox/items", get(list_inbox_items))
         .route("/api/drafts", get(list_drafts).post(create_draft))
         .route("/api/drafts/:draft_id", get(get_draft).patch(update_draft))
+        .route("/api/drafts/:draft_id/approve", post(approve_draft))
+        .route("/api/drafts/:draft_id/reject", post(reject_draft))
         .route("/api/drafts/:draft_id/regenerate", post(regenerate_draft))
         .route("/api/drafts/:draft_id/render", post(render_draft_assets))
         .route(
@@ -682,9 +684,9 @@ async fn update_draft(
         .map_err(ApiError::internal)?
         .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
 
-    if !existing.status.is_editable() {
+    if !existing.status.is_editable() && update_contains_content_changes(&payload) {
         return Err(ApiError::bad_request(
-            "published or archived drafts cannot be edited",
+            "published, rejected, archived, or scheduled drafts can only receive workflow status changes",
         ));
     }
 
@@ -709,6 +711,53 @@ async fn update_draft(
         status: payload.status,
         rendered_post_asset_ref: payload.rendered_post_asset_ref,
         rendered_reel_asset_ref: payload.rendered_reel_asset_ref,
+        updated_by_sub: Some(authenticated.user.sub),
+    };
+    let updated = api::drafts::update_post_draft(&state.db, draft_id, &update)
+        .await
+        .map_err(draft_write_error)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    Ok(Json(DraftResponse::from(updated)))
+}
+
+async fn approve_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    update_draft_workflow_status(&state, &headers, draft_id, DraftStatus::Approved).await
+}
+
+async fn reject_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    update_draft_workflow_status(&state, &headers, draft_id, DraftStatus::Rejected).await
+}
+
+async fn update_draft_workflow_status(
+    state: &AppState,
+    headers: &HeaderMap,
+    draft_id: i64,
+    status: DraftStatus,
+) -> Result<Json<DraftResponse>, ApiError> {
+    let authenticated = require_user(state, headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let update = UpdatePostDraft {
+        source_item_id: None,
+        caption_en: None,
+        caption_zh: None,
+        status: Some(status),
+        rendered_post_asset_ref: None,
+        rendered_reel_asset_ref: None,
         updated_by_sub: Some(authenticated.user.sub),
     };
     let updated = api::drafts::update_post_draft(&state.db, draft_id, &update)
@@ -1024,6 +1073,14 @@ fn ensure_positive_draft_id(draft_id: i64) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+fn update_contains_content_changes(payload: &UpdateDraftRequest) -> bool {
+    payload.source_item_id.is_some()
+        || payload.caption_en.is_some()
+        || payload.caption_zh.is_some()
+        || payload.rendered_post_asset_ref.is_some()
+        || payload.rendered_reel_asset_ref.is_some()
 }
 
 fn ensure_positive_source_id(source_id: i64) -> Result<(), ApiError> {

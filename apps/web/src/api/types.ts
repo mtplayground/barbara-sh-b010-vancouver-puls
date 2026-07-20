@@ -18,7 +18,7 @@ export interface StorageHealthResponse {
 export type UserRole = "admin" | "editor";
 export type ContentSourceKind = "rss" | "website" | "instagram" | "manual";
 export type DraftStatus =
-  "draft" | "in_review" | "approved" | "scheduled" | "published" | "archived";
+  "draft" | "in_review" | "approved" | "rejected" | "scheduled" | "published" | "archived";
 
 export interface AuthSessionUserResponse {
   sub: string;

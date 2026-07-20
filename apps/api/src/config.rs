@@ -56,6 +56,9 @@ pub struct InstagramConfig {
     pub app_secret: String,
     pub redirect_uri: String,
     pub graph_api_version: Option<String>,
+    pub access_token: Option<String>,
+    pub business_account_id: Option<String>,
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +127,9 @@ impl AppConfig {
             instagram_app_secret_configured = instagram.app_secret_configured,
             instagram_redirect_uri_configured = instagram.redirect_uri_configured,
             instagram_graph_api_version_configured = instagram.graph_api_version_configured,
+            instagram_access_token_configured = instagram.access_token_configured,
+            instagram_business_account_id_configured = instagram.business_account_id_configured,
+            instagram_username_configured = instagram.username_configured,
             claude_api_key_configured = claude.api_key_configured,
             "configuration loaded"
         );
@@ -159,6 +165,9 @@ struct InstagramSummary {
     app_secret_configured: bool,
     redirect_uri_configured: bool,
     graph_api_version_configured: bool,
+    access_token_configured: bool,
+    business_account_id_configured: bool,
+    username_configured: bool,
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +302,9 @@ impl InstagramConfig {
             "INSTAGRAM_APP_SECRET",
             "INSTAGRAM_REDIRECT_URI",
             "INSTAGRAM_GRAPH_API_VERSION",
+            "INSTAGRAM_ACCESS_TOKEN",
+            "INSTAGRAM_BUSINESS_ACCOUNT_ID",
+            "INSTAGRAM_USERNAME",
         ];
 
         if !any_var_present(&names)? {
@@ -304,6 +316,9 @@ impl InstagramConfig {
             app_secret: required_var("INSTAGRAM_APP_SECRET")?,
             redirect_uri: required_var("INSTAGRAM_REDIRECT_URI")?,
             graph_api_version: optional_var("INSTAGRAM_GRAPH_API_VERSION")?,
+            access_token: optional_var("INSTAGRAM_ACCESS_TOKEN")?,
+            business_account_id: optional_var("INSTAGRAM_BUSINESS_ACCOUNT_ID")?,
+            username: optional_var("INSTAGRAM_USERNAME")?,
         }))
     }
 
@@ -313,6 +328,9 @@ impl InstagramConfig {
             app_secret_configured: !self.app_secret.is_empty(),
             redirect_uri_configured: !self.redirect_uri.is_empty(),
             graph_api_version_configured: self.graph_api_version.is_some(),
+            access_token_configured: self.access_token.is_some(),
+            business_account_id_configured: self.business_account_id.is_some(),
+            username_configured: self.username.is_some(),
         }
     }
 }

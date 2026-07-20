@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use s3::{creds::Credentials, Bucket, Region};
+use url::Url;
 
 use crate::config::ObjectStorageConfig;
 
 #[derive(Debug, Clone)]
 pub struct ObjectStorage {
     bucket_client: Box<Bucket>,
+    endpoint: String,
     bucket: String,
     prefix: String,
 }
@@ -37,6 +39,7 @@ impl ObjectStorage {
 
         Ok(Self {
             bucket_client,
+            endpoint: config.endpoint.clone(),
             bucket: config.bucket.clone(),
             prefix: normalize_prefix(&config.prefix),
         })
@@ -48,6 +51,30 @@ impl ObjectStorage {
 
     pub fn prefix(&self) -> &str {
         &self.prefix
+    }
+
+    pub fn public_url_for_stored_key(&self, stored_key: &str) -> Result<String> {
+        let normalized_key = normalize_object_key(stored_key)?;
+        let mut url =
+            Url::parse(ensure_trailing_slash(&self.endpoint).as_str()).with_context(|| {
+                format!(
+                    "failed to parse object storage endpoint `{}`",
+                    self.endpoint
+                )
+            })?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("object storage endpoint cannot be a base URL"))?;
+            segments.pop_if_empty();
+            segments.push(&self.bucket);
+
+            for segment in normalized_key.split('/') {
+                segments.push(segment);
+            }
+        }
+
+        Ok(url.to_string())
     }
 
     pub fn object_key(&self, key: &str) -> Result<String> {
@@ -154,6 +181,14 @@ fn normalize_prefix(prefix: &str) -> String {
     prefix.trim_matches('/').to_owned()
 }
 
+fn ensure_trailing_slash(value: &str) -> String {
+    if value.ends_with('/') {
+        value.to_owned()
+    } else {
+        format!("{value}/")
+    }
+}
+
 fn is_success_status(status_code: u16) -> bool {
     (200..300).contains(&status_code)
 }
@@ -214,8 +249,21 @@ mod tests {
 
         Ok(ObjectStorage {
             bucket_client,
+            endpoint: "https://object-storage.example.com".to_owned(),
             bucket: "bucket".to_owned(),
             prefix: prefix.to_owned(),
         })
+    }
+
+    #[test]
+    fn public_url_uses_stored_key_without_double_prefixing() -> Result<()> {
+        let storage = test_storage("rendered/assets")?;
+
+        assert_eq!(
+            storage.public_url_for_stored_key("rendered/assets/posts/reel 1.svg")?,
+            "https://object-storage.example.com/bucket/rendered/assets/posts/reel%201.svg"
+        );
+
+        Ok(())
     }
 }

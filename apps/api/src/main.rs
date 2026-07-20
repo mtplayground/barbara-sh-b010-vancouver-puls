@@ -15,6 +15,10 @@ use api::{
     ingestion,
     instagram::{InstagramAccountType, InstagramConnection, NewInstagramConnection},
     invites::{self, AcceptInviteError, UserInvite},
+    publishing::{
+        InstagramPublishInput, InstagramPublishTarget, InstagramPublisher, NewPublishLog,
+        PublishLog, PublishLogStatus,
+    },
     schedule::{self, NewScheduleAssignment, ScheduleSlot},
     sources::{
         ContentSource, ContentSourceKind, IngestedItem, NewContentSource, UpdateContentSource,
@@ -46,6 +50,7 @@ struct AppState {
     email: Option<EmailService>,
     instagram: Option<InstagramConfig>,
     drafting: Option<DraftingService>,
+    publisher: InstagramPublisher,
     self_url: Option<String>,
 }
 
@@ -236,6 +241,37 @@ struct RenderDraftResponse {
     draft: DraftResponse,
     post_asset_ref: String,
     reel_asset_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishDraftRequest {
+    target: Option<InstagramPublishTarget>,
+}
+
+#[derive(Debug, Serialize)]
+struct PublishDraftResponse {
+    draft: DraftResponse,
+    log: PublishLogResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct PublishLogsResponse {
+    logs: Vec<PublishLogResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct PublishLogResponse {
+    id: i64,
+    draft_id: i64,
+    target: InstagramPublishTarget,
+    status: PublishLogStatus,
+    instagram_account_id: String,
+    asset_ref: String,
+    graph_container_id: Option<String>,
+    graph_media_id: Option<String>,
+    error_message: Option<String>,
+    requested_by_sub: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +474,7 @@ fn app(
         email,
         instagram: config.instagram.clone(),
         drafting,
+        publisher: InstagramPublisher::new(),
         self_url: config.server.self_url.clone(),
     };
 
@@ -477,6 +514,8 @@ fn app(
         .route("/api/drafts/:draft_id/reject", post(reject_draft))
         .route("/api/drafts/:draft_id/regenerate", post(regenerate_draft))
         .route("/api/drafts/:draft_id/render", post(render_draft_assets))
+        .route("/api/drafts/:draft_id/publish", post(publish_draft))
+        .route("/api/drafts/:draft_id/publish-log", get(list_publish_logs))
         .route("/api/calendar", get(list_calendar))
         .route("/api/calendar/slots", post(assign_calendar_slot))
         .route(
@@ -1204,6 +1243,131 @@ async fn render_draft_assets(
     }))
 }
 
+async fn publish_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+    Json(payload): Json<PublishDraftRequest>,
+) -> Result<Json<PublishDraftResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_schedule_content() {
+        return Err(ApiError::forbidden(
+            "content publish permissions are required",
+        ));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let storage = storage_service(&state)?;
+    let draft = api::drafts::find_post_draft(&state.db, draft_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+    let target = payload.target.unwrap_or(InstagramPublishTarget::Post);
+    let connection = active_instagram_connection(&state).await?;
+    let asset_ref = publish_asset_ref(&draft, target)?;
+    let media_url = storage
+        .public_url_for_stored_key(asset_ref)
+        .map_err(publishing_error)?;
+    let caption = instagram_caption(&draft);
+    let publish_input = InstagramPublishInput {
+        instagram_account_id: connection.instagram_account_id.clone(),
+        access_token: connection.access_token.clone(),
+        graph_api_version: connection.graph_api_version.clone(),
+        target,
+        media_url,
+        caption,
+    };
+
+    match state.publisher.publish(&publish_input).await {
+        Ok(success) => {
+            let log = api::publishing::create_publish_log(
+                &state.db,
+                &NewPublishLog {
+                    draft_id: draft.id,
+                    target,
+                    status: PublishLogStatus::Success,
+                    instagram_account_id: connection.instagram_account_id,
+                    asset_ref: asset_ref.to_owned(),
+                    graph_container_id: Some(success.graph_container_id),
+                    graph_media_id: Some(success.graph_media_id),
+                    error_message: None,
+                    requested_by_sub: Some(authenticated.user.sub.clone()),
+                },
+            )
+            .await
+            .map_err(publishing_error)?;
+            let update = UpdatePostDraft {
+                source_item_id: None,
+                caption_en: None,
+                caption_zh: None,
+                status: Some(DraftStatus::Published),
+                rendered_post_asset_ref: None,
+                rendered_reel_asset_ref: None,
+                updated_by_sub: Some(authenticated.user.sub),
+            };
+            let updated = api::drafts::update_post_draft(&state.db, draft.id, &update)
+                .await
+                .map_err(draft_write_error)?
+                .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+            Ok(Json(PublishDraftResponse {
+                draft: DraftResponse::from(updated),
+                log: PublishLogResponse::from(log),
+            }))
+        }
+        Err(error) => {
+            let message = error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            let _failure_log = api::publishing::create_publish_log(
+                &state.db,
+                &NewPublishLog {
+                    draft_id: draft.id,
+                    target,
+                    status: PublishLogStatus::Failure,
+                    instagram_account_id: connection.instagram_account_id,
+                    asset_ref: asset_ref.to_owned(),
+                    graph_container_id: None,
+                    graph_media_id: None,
+                    error_message: Some(message.clone()),
+                    requested_by_sub: Some(authenticated.user.sub),
+                },
+            )
+            .await
+            .map_err(publishing_error)?;
+
+            Err(publishing_error(anyhow::anyhow!(message)))
+        }
+    }
+}
+
+async fn list_publish_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+) -> Result<Json<PublishLogsResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let logs = api::publishing::list_publish_logs_for_draft(&state.db, draft_id)
+        .await
+        .map_err(publishing_error)?
+        .into_iter()
+        .map(PublishLogResponse::from)
+        .collect();
+
+    Ok(Json(PublishLogsResponse { logs }))
+}
+
 async fn list_calendar(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1458,6 +1622,44 @@ async fn instagram_status_response(state: &AppState) -> Result<InstagramStatusRe
     })
 }
 
+async fn active_instagram_connection(state: &AppState) -> Result<InstagramConnection, ApiError> {
+    let connection = api::instagram::find_instagram_connection(&state.db)
+        .await
+        .map_err(ApiError::internal)?
+        .filter(|connection| connection.disconnected_at.is_none())
+        .ok_or_else(|| ApiError::service_unavailable("Instagram account is not connected"))?;
+
+    if connection.access_token.trim().is_empty() {
+        return Err(ApiError::service_unavailable(
+            "Instagram access token is not configured",
+        ));
+    }
+
+    Ok(connection)
+}
+
+fn publish_asset_ref(draft: &PostDraft, target: InstagramPublishTarget) -> Result<&str, ApiError> {
+    if !matches!(draft.status, DraftStatus::Approved | DraftStatus::Scheduled) {
+        return Err(ApiError::bad_request(
+            "only approved or scheduled drafts can be published",
+        ));
+    }
+
+    let asset_ref = match target {
+        InstagramPublishTarget::Post => draft.rendered_post_asset_ref.as_deref(),
+        InstagramPublishTarget::Reel => draft.rendered_reel_asset_ref.as_deref(),
+    };
+
+    asset_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("draft must have a rendered asset before publishing"))
+}
+
+fn instagram_caption(draft: &PostDraft) -> String {
+    format!("{}\n\n{}", draft.caption_en.trim(), draft.caption_zh.trim())
+}
+
 async fn draft_generation_input(
     state: &AppState,
     payload: &CreateDraftRequest,
@@ -1604,6 +1806,39 @@ fn rendering_error(error: anyhow::Error) -> ApiError {
 
     if message.contains("draft id must be positive") || message.contains("object key") {
         return ApiError::bad_request(message);
+    }
+
+    ApiError::internal(error)
+}
+
+fn publishing_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("draft id must be positive")
+        || message.contains("Instagram account id is required")
+        || message.contains("Instagram access token is required")
+        || message.contains("Instagram Graph API version is required")
+        || message.contains("Instagram media URL")
+        || message.contains("Instagram caption is required")
+        || message.contains("published asset ref is required")
+        || message.contains("successful publish log requires")
+        || message.contains("failed publish log requires")
+        || message.contains("object key")
+        || message.contains("violates check constraint")
+        || message.contains("violates foreign key constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    if message.contains("Instagram Graph API")
+        || message.contains("failed to create Instagram media container")
+        || message.contains("failed to publish Instagram media container")
+    {
+        return ApiError::service_unavailable(message);
     }
 
     ApiError::internal(error)
@@ -1850,6 +2085,24 @@ impl From<PostDraft> for DraftResponse {
             updated_by_sub: draft.updated_by_sub,
             created_at: draft.created_at,
             updated_at: draft.updated_at,
+        }
+    }
+}
+
+impl From<PublishLog> for PublishLogResponse {
+    fn from(log: PublishLog) -> Self {
+        Self {
+            id: log.id,
+            draft_id: log.draft_id,
+            target: log.target,
+            status: log.status,
+            instagram_account_id: log.instagram_account_id,
+            asset_ref: log.asset_ref,
+            graph_container_id: log.graph_container_id,
+            graph_media_id: log.graph_media_id,
+            error_message: log.error_message,
+            requested_by_sub: log.requested_by_sub,
+            created_at: log.created_at,
         }
     }
 }

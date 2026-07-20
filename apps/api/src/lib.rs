@@ -9,6 +9,7 @@ pub mod drafts;
 pub mod email;
 pub mod error;
 pub mod ingestion;
+pub mod instagram;
 pub mod invites;
 pub mod rendering;
 pub mod schedule;

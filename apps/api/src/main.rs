@@ -5,7 +5,7 @@ use api::{
         BackupContentItem, BackupContentKind, NewBackupContentItem, UpdateBackupContentItem,
     },
     claude::ClaudeClient,
-    config::AppConfig,
+    config::{AppConfig, InstagramConfig},
     cors::cors_layer,
     db,
     drafting::{DraftingService, ManualDraftTopic},
@@ -13,6 +13,7 @@ use api::{
     email::{email_error_to_anyhow, EmailDelivery, EmailSendError, EmailService},
     error::ApiError,
     ingestion,
+    instagram::{InstagramAccountType, InstagramConnection, NewInstagramConnection},
     invites::{self, AcceptInviteError, UserInvite},
     schedule::{self, NewScheduleAssignment, ScheduleSlot},
     sources::{
@@ -43,6 +44,7 @@ struct AppState {
     storage: Option<ObjectStorage>,
     auth: Option<AuthService>,
     email: Option<EmailService>,
+    instagram: Option<InstagramConfig>,
     drafting: Option<DraftingService>,
     self_url: Option<String>,
 }
@@ -65,6 +67,37 @@ struct StorageHealthResponse {
     storage: &'static str,
     bucket: Option<String>,
     prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstagramStatusResponse {
+    configured: bool,
+    token_available: bool,
+    env_account_available: bool,
+    connected: bool,
+    account: Option<InstagramConnectionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstagramConnectionResponse {
+    instagram_account_id: String,
+    username: Option<String>,
+    account_type: InstagramAccountType,
+    graph_api_version: String,
+    app_id: String,
+    token_source: String,
+    token_configured: bool,
+    connected_by_sub: Option<String>,
+    disconnected_at: Option<chrono::DateTime<chrono::Utc>>,
+    connected_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectInstagramRequest {
+    instagram_account_id: Option<String>,
+    username: Option<String>,
+    account_type: Option<InstagramAccountType>,
 }
 
 #[derive(Debug, Serialize)]
@@ -403,6 +436,7 @@ fn app(
         storage,
         auth,
         email,
+        instagram: config.instagram.clone(),
         drafting,
         self_url: config.server.self_url.clone(),
     };
@@ -414,6 +448,12 @@ fn app(
         .route("/api/health/storage", get(storage_health))
         .route("/api/auth/login", get(auth_login))
         .route("/api/auth/session", get(auth_session))
+        .route("/api/settings/instagram", get(instagram_status))
+        .route("/api/settings/instagram/connect", post(connect_instagram))
+        .route(
+            "/api/settings/instagram/disconnect",
+            post(disconnect_instagram),
+        )
         .route("/api/admin/invites", post(create_invite))
         .route("/api/admin/users", get(list_admin_users))
         .route("/api/admin/users/:sub/role", patch(update_admin_user_role))
@@ -529,6 +569,72 @@ async fn auth_session(
         },
         None => AuthSessionResponse::anonymous(),
     }))
+}
+
+async fn instagram_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<InstagramStatusResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+
+    instagram_status_response(&state).await.map(Json)
+}
+
+async fn connect_instagram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<ConnectInstagramRequest>,
+) -> Result<Json<InstagramStatusResponse>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let config = instagram_config(&state)?;
+    let access_token = config
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::service_unavailable("Instagram access token is not configured"))?;
+    let instagram_account_id = payload
+        .instagram_account_id
+        .as_deref()
+        .or(config.business_account_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request("Instagram account id is required"))?;
+    let username = payload.username.or_else(|| config.username.clone());
+    let connection = NewInstagramConnection {
+        instagram_account_id: instagram_account_id.to_owned(),
+        username,
+        account_type: payload
+            .account_type
+            .unwrap_or(InstagramAccountType::Business),
+        graph_api_version: config
+            .graph_api_version
+            .clone()
+            .unwrap_or_else(|| "v20.0".to_owned()),
+        app_id: config.app_id.clone(),
+        access_token: access_token.to_owned(),
+        token_source: "environment".to_owned(),
+        connected_by_sub: Some(admin.user.sub),
+    };
+
+    api::instagram::connect_instagram_account(&state.db, &connection)
+        .await
+        .map_err(instagram_connection_error)?;
+
+    instagram_status_response(&state).await.map(Json)
+}
+
+async fn disconnect_instagram(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<InstagramStatusResponse>, ApiError> {
+    require_admin(&state, &headers).await?;
+
+    api::instagram::disconnect_instagram_account(&state.db)
+        .await
+        .map_err(ApiError::internal)?;
+
+    instagram_status_response(&state).await.map(Json)
 }
 
 async fn list_admin_users(
@@ -1317,6 +1423,41 @@ fn storage_service(state: &AppState) -> Result<&ObjectStorage, ApiError> {
         .ok_or_else(|| ApiError::service_unavailable("object storage is not configured"))
 }
 
+fn instagram_config(state: &AppState) -> Result<&InstagramConfig, ApiError> {
+    state
+        .instagram
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("Instagram settings are not configured"))
+}
+
+async fn instagram_status_response(state: &AppState) -> Result<InstagramStatusResponse, ApiError> {
+    let connection = api::instagram::find_instagram_connection(&state.db)
+        .await
+        .map_err(ApiError::internal)?;
+    let active_connection = connection.filter(|connection| connection.disconnected_at.is_none());
+    let configured = state.instagram.is_some();
+    let token_available = state
+        .instagram
+        .as_ref()
+        .and_then(|config| config.access_token.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let env_account_available = state
+        .instagram
+        .as_ref()
+        .and_then(|config| config.business_account_id.as_deref())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+
+    Ok(InstagramStatusResponse {
+        configured,
+        token_available,
+        env_account_available,
+        connected: active_connection.is_some(),
+        account: active_connection.map(InstagramConnectionResponse::from),
+    })
+}
+
 async fn draft_generation_input(
     state: &AppState,
     payload: &CreateDraftRequest,
@@ -1531,6 +1672,27 @@ fn backup_content_write_error(error: anyhow::Error) -> ApiError {
     ApiError::internal(error)
 }
 
+fn instagram_connection_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("Instagram account id is required")
+        || message.contains("Instagram Graph API version is required")
+        || message.contains("Instagram app id is required")
+        || message.contains("Instagram access token is required")
+        || message.contains("Instagram token source is required")
+        || message.contains("violates check constraint")
+        || message.contains("violates foreign key constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    ApiError::internal(error)
+}
+
 async fn send_invite_email(
     state: &AppState,
     email: &str,
@@ -1634,6 +1796,24 @@ impl From<IngestedItem> for IngestedItemResponse {
             discovered_at: item.discovered_at,
             ingested_at: item.ingested_at,
             updated_at: item.updated_at,
+        }
+    }
+}
+
+impl From<InstagramConnection> for InstagramConnectionResponse {
+    fn from(connection: InstagramConnection) -> Self {
+        Self {
+            instagram_account_id: connection.instagram_account_id,
+            username: connection.username,
+            account_type: connection.account_type,
+            graph_api_version: connection.graph_api_version,
+            app_id: connection.app_id,
+            token_source: connection.token_source,
+            token_configured: !connection.access_token.trim().is_empty(),
+            connected_by_sub: connection.connected_by_sub,
+            disconnected_at: connection.disconnected_at,
+            connected_at: connection.connected_at,
+            updated_at: connection.updated_at,
         }
     }
 }

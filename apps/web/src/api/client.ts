@@ -2,7 +2,10 @@ import type {
   ApiErrorPayload,
   AdminUserResponse,
   AdminUsersResponse,
+  AssignCalendarSlotRequest,
   AuthSessionResponse,
+  CalendarResponse,
+  CalendarSlotResponse,
   CreateDraftRequest,
   CreateSourceRequest,
   CreateInviteResponse,
@@ -119,6 +122,22 @@ export const apiClient = {
   renderDraft: (id: number) =>
     request<RenderDraftResponse>(`/api/drafts/${encodeURIComponent(id)}/render`, {
       method: "POST",
+    }),
+  listCalendar: (days = 14, start?: string) => {
+    const params = new URLSearchParams({ days: String(days) });
+    if (start) {
+      params.set("start", start);
+    }
+
+    return request<CalendarResponse>(`/api/calendar?${params.toString()}`);
+  },
+  assignCalendarSlot: (assignment: AssignCalendarSlotRequest) =>
+    request<CalendarSlotResponse>("/api/calendar/slots", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(assignment),
     }),
 };
 

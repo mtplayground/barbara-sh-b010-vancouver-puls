@@ -161,6 +161,29 @@ export interface RenderDraftResponse {
   reel_asset_ref: string;
 }
 
+export interface CalendarSlotResponse {
+  id: number | null;
+  slot_date: string;
+  slot_time: string;
+  draft: DraftResponse | null;
+  is_empty: boolean;
+  is_upcoming: boolean;
+}
+
+export interface CalendarResponse {
+  start_date: string;
+  end_date: string;
+  daily_cadence: "one_post_per_day";
+  empty_upcoming_slots: number;
+  slots: CalendarSlotResponse[];
+}
+
+export interface AssignCalendarSlotRequest {
+  slot_date: string;
+  slot_time?: string;
+  draft_id: number;
+}
+
 export interface ApiErrorPayload {
   error: {
     code: string;

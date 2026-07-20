@@ -14,6 +14,7 @@ use api::{
     error::ApiError,
     ingestion,
     instagram::{InstagramAccountType, InstagramConnection, NewInstagramConnection},
+    insights::{self, InstagramInsightSnapshot, InstagramInsightsPuller},
     invites::{self, AcceptInviteError, UserInvite},
     publisher_scheduler,
     publishing::{InstagramPublishTarget, InstagramPublisher, PublishLog, PublishLogStatus},
@@ -49,6 +50,7 @@ struct AppState {
     instagram: Option<InstagramConfig>,
     drafting: Option<DraftingService>,
     publisher: InstagramPublisher,
+    insights_puller: InstagramInsightsPuller,
     self_url: Option<String>,
 }
 
@@ -273,6 +275,28 @@ struct PublishLogResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct InstagramInsightsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstagramInsightSnapshotsResponse {
+    snapshots: Vec<InstagramInsightSnapshotResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct InstagramInsightSnapshotResponse {
+    id: i64,
+    instagram_account_id: String,
+    followers_count: i64,
+    reach: i64,
+    saves: i64,
+    shares: i64,
+    captured_at: chrono::DateTime<chrono::Utc>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CalendarQuery {
     start: Option<NaiveDate>,
     days: Option<i64>,
@@ -440,6 +464,7 @@ async fn main() -> Result<()> {
     }
 
     let publisher = InstagramPublisher::new();
+    let insights_puller = InstagramInsightsPuller::new();
     let _ingestion_job = ingestion::spawn_ingestion_job(pool.clone(), storage.clone())
         .context("failed to start scheduled ingestion job")?;
     let _publisher_job = publisher_scheduler::spawn_scheduled_publisher_job(
@@ -449,6 +474,9 @@ async fn main() -> Result<()> {
         publisher.clone(),
     )
     .context("failed to start scheduled publisher job")?;
+    let _insights_job =
+        insights::spawn_instagram_insights_job(pool.clone(), insights_puller.clone())
+            .context("failed to start Instagram insights job")?;
 
     let bind_addr = config.server.bind_addr()?;
     let listener = TcpListener::bind(bind_addr)
@@ -459,7 +487,16 @@ async fn main() -> Result<()> {
 
     axum::serve(
         listener,
-        app(pool, storage, auth, email, drafting, publisher, config),
+        app(
+            pool,
+            storage,
+            auth,
+            email,
+            drafting,
+            publisher,
+            insights_puller,
+            config,
+        ),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
@@ -475,6 +512,7 @@ fn app(
     email: Option<EmailService>,
     drafting: Option<DraftingService>,
     publisher: InstagramPublisher,
+    insights_puller: InstagramInsightsPuller,
     config: AppConfig,
 ) -> Router {
     let state = AppState {
@@ -485,6 +523,7 @@ fn app(
         instagram: config.instagram.clone(),
         drafting,
         publisher,
+        insights_puller,
         self_url: config.server.self_url.clone(),
     };
 
@@ -526,6 +565,10 @@ fn app(
         .route("/api/drafts/:draft_id/render", post(render_draft_assets))
         .route("/api/drafts/:draft_id/publish", post(publish_draft))
         .route("/api/drafts/:draft_id/publish-log", get(list_publish_logs))
+        .route(
+            "/api/insights/instagram",
+            get(list_instagram_insights).post(pull_instagram_insights),
+        )
         .route("/api/calendar", get(list_calendar))
         .route("/api/calendar/slots", post(assign_calendar_slot))
         .route(
@@ -1317,6 +1360,50 @@ async fn list_publish_logs(
     Ok(Json(PublishLogsResponse { logs }))
 }
 
+async fn list_instagram_insights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstagramInsightsQuery>,
+) -> Result<Json<InstagramInsightSnapshotsResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    let snapshots =
+        api::insights::list_instagram_insight_snapshots(&state.db, query.limit.unwrap_or(30))
+            .await
+            .map_err(insights_error)?
+            .into_iter()
+            .map(InstagramInsightSnapshotResponse::from)
+            .collect();
+
+    Ok(Json(InstagramInsightSnapshotsResponse { snapshots }))
+}
+
+async fn pull_instagram_insights(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<InstagramInsightSnapshotResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    let connection = active_instagram_connection(&state).await?;
+    let snapshot = api::insights::pull_and_store_instagram_insights(
+        &state.db,
+        &state.insights_puller,
+        &connection,
+    )
+    .await
+    .map_err(insights_error)?;
+
+    Ok(Json(InstagramInsightSnapshotResponse::from(snapshot)))
+}
+
 async fn list_calendar(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1771,6 +1858,32 @@ fn publishing_error(error: anyhow::Error) -> ApiError {
     ApiError::internal(error)
 }
 
+fn insights_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("Instagram account id is required")
+        || message.contains("Instagram access token is required")
+        || message.contains("Instagram Graph API version is required")
+        || message.contains("Instagram insight counts must be non-negative")
+        || message.contains("violates check constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    if message.contains("Instagram Graph API")
+        || message.contains("failed to request Instagram")
+        || message.contains("failed to decode Instagram")
+    {
+        return ApiError::service_unavailable(message);
+    }
+
+    ApiError::internal(error)
+}
+
 fn calendar_error(error: anyhow::Error) -> ApiError {
     let message = error
         .chain()
@@ -2030,6 +2143,21 @@ impl From<PublishLog> for PublishLogResponse {
             error_message: log.error_message,
             requested_by_sub: log.requested_by_sub,
             created_at: log.created_at,
+        }
+    }
+}
+
+impl From<InstagramInsightSnapshot> for InstagramInsightSnapshotResponse {
+    fn from(snapshot: InstagramInsightSnapshot) -> Self {
+        Self {
+            id: snapshot.id,
+            instagram_account_id: snapshot.instagram_account_id,
+            followers_count: snapshot.followers_count,
+            reach: snapshot.reach,
+            saves: snapshot.saves,
+            shares: snapshot.shares,
+            captured_at: snapshot.captured_at,
+            created_at: snapshot.created_at,
         }
     }
 }

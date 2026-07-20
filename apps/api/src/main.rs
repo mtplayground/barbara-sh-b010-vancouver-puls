@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use api::{
     auth::{self, AuthService, AuthenticatedUser},
+    claude::ClaudeClient,
     config::AppConfig,
     cors::cors_layer,
     db,
+    drafting::{DraftingService, ManualDraftTopic},
+    drafts::{DraftStatus, NewPostDraft, PostDraft, UpdatePostDraft},
     email::{email_error_to_anyhow, EmailDelivery, EmailSendError, EmailService},
     error::ApiError,
     ingestion,
@@ -35,6 +38,7 @@ struct AppState {
     storage: Option<ObjectStorage>,
     auth: Option<AuthService>,
     email: Option<EmailService>,
+    drafting: Option<DraftingService>,
     self_url: Option<String>,
 }
 
@@ -141,6 +145,54 @@ struct InboxItemsResponse {
     items: Vec<IngestedItemResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DraftsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftsResponse {
+    drafts: Vec<DraftResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct DraftResponse {
+    id: i64,
+    source_item_id: Option<i64>,
+    caption_en: String,
+    caption_zh: String,
+    status: DraftStatus,
+    rendered_post_asset_ref: Option<String>,
+    rendered_reel_asset_ref: Option<String>,
+    created_by_sub: Option<String>,
+    updated_by_sub: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateDraftRequest {
+    source_item_id: Option<i64>,
+    manual_topic: Option<String>,
+    manual_notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDraftRequest {
+    source_item_id: Option<Option<i64>>,
+    caption_en: Option<String>,
+    caption_zh: Option<String>,
+    status: Option<DraftStatus>,
+    rendered_post_asset_ref: Option<Option<String>>,
+    rendered_reel_asset_ref: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegenerateDraftRequest {
+    manual_topic: Option<String>,
+    manual_notes: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct IngestedItemResponse {
     id: i64,
@@ -211,6 +263,11 @@ async fn main() -> Result<()> {
     config.log_summary();
     let auth = config.auth.clone().map(AuthService::new);
     let email = config.email.clone().map(EmailService::new);
+    let drafting = config
+        .claude
+        .clone()
+        .map(ClaudeClient::new)
+        .map(DraftingService::new);
     let storage = match &config.object_storage {
         Some(object_storage_config) => {
             Some(ObjectStorage::from_config(object_storage_config).await?)
@@ -235,7 +292,7 @@ async fn main() -> Result<()> {
 
     info!("api listening on {bind_addr}");
 
-    axum::serve(listener, app(pool, storage, auth, email, config))
+    axum::serve(listener, app(pool, storage, auth, email, drafting, config))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("api server failed")?;
@@ -248,6 +305,7 @@ fn app(
     storage: Option<ObjectStorage>,
     auth: Option<AuthService>,
     email: Option<EmailService>,
+    drafting: Option<DraftingService>,
     config: AppConfig,
 ) -> Router {
     let state = AppState {
@@ -255,6 +313,7 @@ fn app(
         storage,
         auth,
         email,
+        drafting,
         self_url: config.server.self_url.clone(),
     };
 
@@ -274,6 +333,9 @@ fn app(
             patch(update_source).delete(delete_source),
         )
         .route("/api/inbox/items", get(list_inbox_items))
+        .route("/api/drafts", get(list_drafts).post(create_draft))
+        .route("/api/drafts/:draft_id", get(get_draft).patch(update_draft))
+        .route("/api/drafts/:draft_id/regenerate", post(regenerate_draft))
         .route(
             "/api/invites/accept",
             get(accept_invite_redirect).post(accept_invite),
@@ -511,6 +573,210 @@ async fn list_inbox_items(
     Ok(Json(InboxItemsResponse { items }))
 }
 
+async fn list_drafts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DraftsQuery>,
+) -> Result<Json<DraftsResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    let drafts = api::drafts::list_post_drafts(&state.db, query.limit.unwrap_or(50))
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(DraftResponse::from)
+        .collect();
+
+    Ok(Json(DraftsResponse { drafts }))
+}
+
+async fn get_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let draft = api::drafts::find_post_draft(&state.db, draft_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    Ok(Json(DraftResponse::from(draft)))
+}
+
+async fn create_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateDraftRequest>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_draft_content() {
+        return Err(ApiError::forbidden(
+            "content draft permissions are required",
+        ));
+    }
+
+    let captions = match draft_generation_input(&state, &payload).await? {
+        DraftGenerationInput::IngestedItem(item) => drafting_service(&state)?
+            .generate_from_ingested_item(&item)
+            .await
+            .map_err(drafting_error)?,
+        DraftGenerationInput::ManualTopic(topic) => drafting_service(&state)?
+            .generate_from_manual_topic(&topic)
+            .await
+            .map_err(drafting_error)?,
+    };
+
+    let draft = NewPostDraft {
+        source_item_id: payload.source_item_id,
+        caption_en: captions.caption_en,
+        caption_zh: captions.caption_zh,
+        status: Some(DraftStatus::Draft),
+        rendered_post_asset_ref: None,
+        rendered_reel_asset_ref: None,
+        created_by_sub: Some(authenticated.user.sub),
+    };
+    let created = api::drafts::create_post_draft(&state.db, &draft)
+        .await
+        .map_err(draft_write_error)?;
+
+    Ok(Json(DraftResponse::from(created)))
+}
+
+async fn update_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+    Json(payload): Json<UpdateDraftRequest>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let existing = api::drafts::find_post_draft(&state.db, draft_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    if !existing.status.is_editable() {
+        return Err(ApiError::bad_request(
+            "published or archived drafts cannot be edited",
+        ));
+    }
+
+    if payload.source_item_id.is_none()
+        && payload.caption_en.is_none()
+        && payload.caption_zh.is_none()
+        && payload.status.is_none()
+        && payload.rendered_post_asset_ref.is_none()
+        && payload.rendered_reel_asset_ref.is_none()
+    {
+        return Err(ApiError::bad_request("draft update has no changes"));
+    }
+
+    if let Some(Some(source_item_id)) = payload.source_item_id {
+        find_required_ingested_item(&state, source_item_id).await?;
+    }
+
+    let update = UpdatePostDraft {
+        source_item_id: payload.source_item_id,
+        caption_en: payload.caption_en,
+        caption_zh: payload.caption_zh,
+        status: payload.status,
+        rendered_post_asset_ref: payload.rendered_post_asset_ref,
+        rendered_reel_asset_ref: payload.rendered_reel_asset_ref,
+        updated_by_sub: Some(authenticated.user.sub),
+    };
+    let updated = api::drafts::update_post_draft(&state.db, draft_id, &update)
+        .await
+        .map_err(draft_write_error)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    Ok(Json(DraftResponse::from(updated)))
+}
+
+async fn regenerate_draft(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+    Json(payload): Json<RegenerateDraftRequest>,
+) -> Result<Json<DraftResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_draft_content() {
+        return Err(ApiError::forbidden(
+            "content draft permissions are required",
+        ));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let existing = api::drafts::find_post_draft(&state.db, draft_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    if !existing.status.is_editable() {
+        return Err(ApiError::bad_request(
+            "published or archived drafts cannot be regenerated",
+        ));
+    }
+
+    let captions = if let Some(topic) = manual_topic_from_regenerate_payload(&payload) {
+        drafting_service(&state)?
+            .generate_from_manual_topic(&topic)
+            .await
+            .map_err(drafting_error)?
+    } else if let Some(source_item_id) = existing.source_item_id {
+        let item = find_required_ingested_item(&state, source_item_id).await?;
+        drafting_service(&state)?
+            .generate_from_ingested_item(&item)
+            .await
+            .map_err(drafting_error)?
+    } else {
+        let fallback_topic = ManualDraftTopic {
+            topic: existing.caption_en.clone(),
+            notes: Some(existing.caption_zh.clone()),
+        };
+        drafting_service(&state)?
+            .generate_from_manual_topic(&fallback_topic)
+            .await
+            .map_err(drafting_error)?
+    };
+
+    let update = UpdatePostDraft {
+        source_item_id: None,
+        caption_en: Some(captions.caption_en),
+        caption_zh: Some(captions.caption_zh),
+        status: Some(DraftStatus::Draft),
+        rendered_post_asset_ref: None,
+        rendered_reel_asset_ref: None,
+        updated_by_sub: Some(authenticated.user.sub),
+    };
+    let updated = api::drafts::update_post_draft(&state.db, draft_id, &update)
+        .await
+        .map_err(draft_write_error)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    Ok(Json(DraftResponse::from(updated)))
+}
+
 async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -615,12 +881,130 @@ async fn require_admin(
     Ok(authenticated)
 }
 
+fn drafting_service(state: &AppState) -> Result<&DraftingService, ApiError> {
+    state
+        .drafting
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("drafting service is not configured"))
+}
+
+async fn draft_generation_input(
+    state: &AppState,
+    payload: &CreateDraftRequest,
+) -> Result<DraftGenerationInput, ApiError> {
+    if state.drafting.is_none() {
+        return Err(ApiError::service_unavailable(
+            "drafting service is not configured",
+        ));
+    }
+
+    let manual_topic = payload
+        .manual_topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (payload.source_item_id, manual_topic) {
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "provide either source_item_id or manual_topic, not both",
+        )),
+        (Some(source_item_id), None) => find_required_ingested_item(state, source_item_id)
+            .await
+            .map(DraftGenerationInput::IngestedItem),
+        (None, Some(topic)) => Ok(DraftGenerationInput::ManualTopic(ManualDraftTopic {
+            topic: topic.to_owned(),
+            notes: payload.manual_notes.clone(),
+        })),
+        (None, None) => Err(ApiError::bad_request(
+            "source_item_id or manual_topic is required",
+        )),
+    }
+}
+
+async fn find_required_ingested_item(
+    state: &AppState,
+    item_id: i64,
+) -> Result<IngestedItem, ApiError> {
+    if item_id < 1 {
+        return Err(ApiError::bad_request("source item id must be positive"));
+    }
+
+    api::sources::find_ingested_item(&state.db, item_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("source item was not found"))
+}
+
+fn manual_topic_from_regenerate_payload(
+    payload: &RegenerateDraftRequest,
+) -> Option<ManualDraftTopic> {
+    payload
+        .manual_topic
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|topic| ManualDraftTopic {
+            topic: topic.to_owned(),
+            notes: payload.manual_notes.clone(),
+        })
+}
+
+enum DraftGenerationInput {
+    IngestedItem(IngestedItem),
+    ManualTopic(ManualDraftTopic),
+}
+
+fn ensure_positive_draft_id(draft_id: i64) -> Result<(), ApiError> {
+    if draft_id < 1 {
+        return Err(ApiError::bad_request("draft id must be positive"));
+    }
+
+    Ok(())
+}
+
 fn ensure_positive_source_id(source_id: i64) -> Result<(), ApiError> {
     if source_id < 1 {
         return Err(ApiError::bad_request("source id must be positive"));
     }
 
     Ok(())
+}
+
+fn draft_write_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("source item id must be positive")
+        || message.contains("English caption is required")
+        || message.contains("Chinese caption is required")
+        || message.contains("violates check constraint")
+        || message.contains("violates foreign key constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    ApiError::internal(error)
+}
+
+fn drafting_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("manual draft topic is required") {
+        return ApiError::bad_request(message);
+    }
+
+    if message.contains("rate limited") {
+        return ApiError::service_unavailable("drafting service is rate limited");
+    }
+
+    ApiError::internal(error)
 }
 
 fn source_write_error(error: anyhow::Error) -> ApiError {
@@ -745,6 +1129,24 @@ impl From<IngestedItem> for IngestedItemResponse {
             discovered_at: item.discovered_at,
             ingested_at: item.ingested_at,
             updated_at: item.updated_at,
+        }
+    }
+}
+
+impl From<PostDraft> for DraftResponse {
+    fn from(draft: PostDraft) -> Self {
+        Self {
+            id: draft.id,
+            source_item_id: draft.source_item_id,
+            caption_en: draft.caption_en,
+            caption_zh: draft.caption_zh,
+            status: draft.status,
+            rendered_post_asset_ref: draft.rendered_post_asset_ref,
+            rendered_reel_asset_ref: draft.rendered_reel_asset_ref,
+            created_by_sub: draft.created_by_sub,
+            updated_by_sub: draft.updated_by_sub,
+            created_at: draft.created_at,
+            updated_at: draft.updated_at,
         }
     }
 }

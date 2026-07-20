@@ -267,10 +267,21 @@ fn validate_draft_input(
         anyhow::bail!("source item id must be positive");
     }
 
+    let caption_en = caption_en.trim();
+    let caption_zh = caption_zh.trim();
+
+    if caption_en.is_empty() {
+        anyhow::bail!("English caption is required");
+    }
+
+    if caption_zh.is_empty() {
+        anyhow::bail!("Chinese caption is required");
+    }
+
     Ok(ValidatedPostDraftInput {
         source_item_id,
-        caption_en: caption_en.trim().to_owned(),
-        caption_zh: caption_zh.trim().to_owned(),
+        caption_en: caption_en.to_owned(),
+        caption_zh: caption_zh.to_owned(),
         status,
         rendered_post_asset_ref,
         rendered_reel_asset_ref,
@@ -349,5 +360,16 @@ mod tests {
             };
 
         assert!(error.to_string().contains("source item id"));
+    }
+
+    #[test]
+    fn captions_are_required() {
+        let error =
+            match super::validate_draft_input(None, " ", "中文", DraftStatus::Draft, None, None) {
+                Ok(_) => panic!("empty English caption should be rejected"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains("English caption"));
     }
 }

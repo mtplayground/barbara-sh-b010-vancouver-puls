@@ -7,6 +7,7 @@ import { DashboardRoute } from "./DashboardRoute";
 import { DraftsRoute } from "./DraftsRoute";
 import { InboxRoute } from "./InboxRoute";
 import { LoginRoute } from "./LoginRoute";
+import { PerformanceRoute } from "./PerformanceRoute";
 import { SettingsRoute } from "./SettingsRoute";
 import { SourcesRoute } from "./SourcesRoute";
 import { UsersRoute } from "./UsersRoute";
@@ -22,6 +23,7 @@ export function AppRoutes() {
         <Route path="drafts" element={<DraftsRoute />} />
         <Route path="calendar" element={<CalendarRoute />} />
         <Route path="backup-library" element={<BackupLibraryRoute />} />
+        <Route path="performance" element={<PerformanceRoute />} />
         <Route path="users" element={<UsersRoute />} />
         <Route path="settings" element={<SettingsRoute />} />
         <Route path="*" element={<Navigate to="/" replace />} />

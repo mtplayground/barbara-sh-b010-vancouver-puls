@@ -19,6 +19,7 @@ import type {
   HealthResponse,
   InboxItemsResponse,
   InstagramStatusResponse,
+  InstagramInsightSnapshotsResponse,
   RegenerateDraftRequest,
   RenderDraftResponse,
   SourceResponse,
@@ -174,6 +175,10 @@ export const apiClient = {
       body: JSON.stringify(assignment),
     }),
   getInstagramStatus: () => request<InstagramStatusResponse>("/api/settings/instagram"),
+  listInstagramInsights: (limit = 30) =>
+    request<InstagramInsightSnapshotsResponse>(
+      `/api/insights/instagram?limit=${encodeURIComponent(limit)}`,
+    ),
   connectInstagram: (connection: ConnectInstagramRequest) =>
     request<InstagramStatusResponse>("/api/settings/instagram/connect", {
       method: "POST",

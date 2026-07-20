@@ -244,6 +244,21 @@ export interface InstagramStatusResponse {
   account: InstagramConnectionResponse | null;
 }
 
+export interface InstagramInsightSnapshotResponse {
+  id: number;
+  instagram_account_id: string;
+  followers_count: number;
+  reach: number;
+  saves: number;
+  shares: number;
+  captured_at: string;
+  created_at: string;
+}
+
+export interface InstagramInsightSnapshotsResponse {
+  snapshots: InstagramInsightSnapshotResponse[];
+}
+
 export interface ConnectInstagramRequest {
   instagram_account_id?: string;
   username?: string;

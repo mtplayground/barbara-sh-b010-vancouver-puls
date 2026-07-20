@@ -9,6 +9,7 @@ const navigationItems = [
   { label: "Drafts", to: "/drafts" },
   { label: "Calendar", to: "/calendar" },
   { label: "Backup", to: "/backup-library" },
+  { label: "Performance", to: "/performance" },
   { label: "Users", to: "/users", adminOnly: true },
   { label: "Settings", to: "/settings" },
 ];

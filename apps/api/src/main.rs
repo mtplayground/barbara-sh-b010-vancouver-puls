@@ -194,6 +194,13 @@ struct RegenerateDraftRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct RenderDraftResponse {
+    draft: DraftResponse,
+    post_asset_ref: String,
+    reel_asset_ref: String,
+}
+
+#[derive(Debug, Serialize)]
 struct IngestedItemResponse {
     id: i64,
     source_id: i64,
@@ -336,6 +343,7 @@ fn app(
         .route("/api/drafts", get(list_drafts).post(create_draft))
         .route("/api/drafts/:draft_id", get(get_draft).patch(update_draft))
         .route("/api/drafts/:draft_id/regenerate", post(regenerate_draft))
+        .route("/api/drafts/:draft_id/render", post(render_draft_assets))
         .route(
             "/api/invites/accept",
             get(accept_invite_redirect).post(accept_invite),
@@ -777,6 +785,55 @@ async fn regenerate_draft(
     Ok(Json(DraftResponse::from(updated)))
 }
 
+async fn render_draft_assets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(draft_id): Path<i64>,
+) -> Result<Json<RenderDraftResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    ensure_positive_draft_id(draft_id)?;
+
+    let storage = storage_service(&state)?;
+    let existing = api::drafts::find_post_draft(&state.db, draft_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    if !existing.status.is_editable() {
+        return Err(ApiError::bad_request(
+            "published or archived drafts cannot be rendered",
+        ));
+    }
+
+    let rendered = api::rendering::render_and_store_draft_assets(storage, &existing)
+        .await
+        .map_err(rendering_error)?;
+    let update = UpdatePostDraft {
+        source_item_id: None,
+        caption_en: None,
+        caption_zh: None,
+        status: None,
+        rendered_post_asset_ref: Some(Some(rendered.post_asset_ref.clone())),
+        rendered_reel_asset_ref: Some(Some(rendered.reel_asset_ref.clone())),
+        updated_by_sub: Some(authenticated.user.sub),
+    };
+    let updated = api::drafts::update_post_draft(&state.db, draft_id, &update)
+        .await
+        .map_err(draft_write_error)?
+        .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
+
+    Ok(Json(RenderDraftResponse {
+        draft: DraftResponse::from(updated),
+        post_asset_ref: rendered.post_asset_ref,
+        reel_asset_ref: rendered.reel_asset_ref,
+    }))
+}
+
 async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -886,6 +943,13 @@ fn drafting_service(state: &AppState) -> Result<&DraftingService, ApiError> {
         .drafting
         .as_ref()
         .ok_or_else(|| ApiError::service_unavailable("drafting service is not configured"))
+}
+
+fn storage_service(state: &AppState) -> Result<&ObjectStorage, ApiError> {
+    state
+        .storage
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("object storage is not configured"))
 }
 
 async fn draft_generation_input(
@@ -1002,6 +1066,20 @@ fn drafting_error(error: anyhow::Error) -> ApiError {
 
     if message.contains("rate limited") {
         return ApiError::service_unavailable("drafting service is rate limited");
+    }
+
+    ApiError::internal(error)
+}
+
+fn rendering_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("draft id must be positive") || message.contains("object key") {
+        return ApiError::bad_request(message);
     }
 
     ApiError::internal(error)

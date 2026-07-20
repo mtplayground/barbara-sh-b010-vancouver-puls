@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use api::{
     auth::{self, AuthService, AuthenticatedUser},
+    backup_library::{
+        BackupContentItem, BackupContentKind, NewBackupContentItem, UpdateBackupContentItem,
+    },
     claude::ClaudeClient,
     config::AppConfig,
     cors::cors_layer,
@@ -250,6 +253,52 @@ struct IngestedItemResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct BackupContentQuery {
+    limit: Option<i64>,
+    active: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct BackupContentItemsResponse {
+    items: Vec<BackupContentItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct BackupContentItemResponse {
+    id: i64,
+    kind: BackupContentKind,
+    title: String,
+    body: String,
+    source_url: Option<String>,
+    media_ref: Option<String>,
+    active: bool,
+    created_by_sub: Option<String>,
+    updated_by_sub: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateBackupContentItemRequest {
+    kind: BackupContentKind,
+    title: String,
+    body: String,
+    source_url: Option<String>,
+    media_ref: Option<String>,
+    active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateBackupContentItemRequest {
+    kind: Option<BackupContentKind>,
+    title: Option<String>,
+    body: Option<String>,
+    source_url: Option<Option<String>>,
+    media_ref: Option<Option<String>>,
+    active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateInviteRequest {
     email: String,
 }
@@ -374,6 +423,14 @@ fn app(
             patch(update_source).delete(delete_source),
         )
         .route("/api/inbox/items", get(list_inbox_items))
+        .route(
+            "/api/backup-library",
+            get(list_backup_content_items).post(create_backup_content_item),
+        )
+        .route(
+            "/api/backup-library/:item_id",
+            patch(update_backup_content_item).delete(delete_backup_content_item),
+        )
         .route("/api/drafts", get(list_drafts).post(create_draft))
         .route("/api/drafts/:draft_id", get(get_draft).patch(update_draft))
         .route("/api/drafts/:draft_id/approve", post(approve_draft))
@@ -617,6 +674,128 @@ async fn list_inbox_items(
         .collect();
 
     Ok(Json(InboxItemsResponse { items }))
+}
+
+async fn list_backup_content_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BackupContentQuery>,
+) -> Result<Json<BackupContentItemsResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_edit_content() {
+        return Err(ApiError::forbidden("content edit permissions are required"));
+    }
+
+    let items = api::backup_library::list_backup_content_items(
+        &state.db,
+        query.limit.unwrap_or(50),
+        query.active,
+    )
+    .await
+    .map_err(ApiError::internal)?
+    .into_iter()
+    .map(BackupContentItemResponse::from)
+    .collect();
+
+    Ok(Json(BackupContentItemsResponse { items }))
+}
+
+async fn create_backup_content_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateBackupContentItemRequest>,
+) -> Result<Json<BackupContentItemResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_draft_content() {
+        return Err(ApiError::forbidden(
+            "content draft permissions are required",
+        ));
+    }
+
+    let item = NewBackupContentItem {
+        kind: payload.kind,
+        title: payload.title,
+        body: payload.body,
+        source_url: payload.source_url,
+        media_ref: payload.media_ref,
+        active: payload.active,
+        created_by_sub: Some(authenticated.user.sub),
+    };
+    let created = api::backup_library::create_backup_content_item(&state.db, &item)
+        .await
+        .map_err(backup_content_write_error)?;
+
+    Ok(Json(BackupContentItemResponse::from(created)))
+}
+
+async fn update_backup_content_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<i64>,
+    Json(payload): Json<UpdateBackupContentItemRequest>,
+) -> Result<Json<BackupContentItemResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_draft_content() {
+        return Err(ApiError::forbidden(
+            "content draft permissions are required",
+        ));
+    }
+
+    ensure_positive_backup_content_item_id(item_id)?;
+
+    if payload.kind.is_none()
+        && payload.title.is_none()
+        && payload.body.is_none()
+        && payload.source_url.is_none()
+        && payload.media_ref.is_none()
+        && payload.active.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "backup content update has no changes",
+        ));
+    }
+
+    let update = UpdateBackupContentItem {
+        kind: payload.kind,
+        title: payload.title,
+        body: payload.body,
+        source_url: payload.source_url,
+        media_ref: payload.media_ref,
+        active: payload.active,
+        updated_by_sub: Some(authenticated.user.sub),
+    };
+    let updated = api::backup_library::update_backup_content_item(&state.db, item_id, &update)
+        .await
+        .map_err(backup_content_write_error)?
+        .ok_or_else(|| ApiError::not_found_message("backup content item was not found"))?;
+
+    Ok(Json(BackupContentItemResponse::from(updated)))
+}
+
+async fn delete_backup_content_item(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(item_id): Path<i64>,
+) -> Result<Json<BackupContentItemResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_draft_content() {
+        return Err(ApiError::forbidden(
+            "content draft permissions are required",
+        ));
+    }
+
+    ensure_positive_backup_content_item_id(item_id)?;
+
+    let deleted = api::backup_library::delete_backup_content_item(&state.db, item_id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found_message("backup content item was not found"))?;
+
+    Ok(Json(BackupContentItemResponse::from(deleted)))
 }
 
 async fn list_drafts(
@@ -1228,6 +1407,16 @@ fn ensure_positive_source_id(source_id: i64) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn ensure_positive_backup_content_item_id(item_id: i64) -> Result<(), ApiError> {
+    if item_id < 1 {
+        return Err(ApiError::bad_request(
+            "backup content item id must be positive",
+        ));
+    }
+
+    Ok(())
+}
+
 fn draft_write_error(error: anyhow::Error) -> ApiError {
     let message = error
         .chain()
@@ -1316,6 +1505,25 @@ fn source_write_error(error: anyhow::Error) -> ApiError {
         || message.contains("source url or external id")
         || message.contains("duplicate key value violates unique constraint")
         || message.contains("violates check constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    ApiError::internal(error)
+}
+
+fn backup_content_write_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("backup content title is required")
+        || message.contains("backup content body is required")
+        || message.contains("backup content source url")
+        || message.contains("violates check constraint")
+        || message.contains("violates foreign key constraint")
     {
         return ApiError::bad_request(message);
     }
@@ -1425,6 +1633,24 @@ impl From<IngestedItem> for IngestedItemResponse {
             source_published_at: item.source_published_at,
             discovered_at: item.discovered_at,
             ingested_at: item.ingested_at,
+            updated_at: item.updated_at,
+        }
+    }
+}
+
+impl From<BackupContentItem> for BackupContentItemResponse {
+    fn from(item: BackupContentItem) -> Self {
+        Self {
+            id: item.id,
+            kind: item.kind,
+            title: item.title,
+            body: item.body,
+            source_url: item.source_url,
+            media_ref: item.media_ref,
+            active: item.active,
+            created_by_sub: item.created_by_sub,
+            updated_by_sub: item.updated_by_sub,
+            created_at: item.created_at,
             updated_at: item.updated_at,
         }
     }

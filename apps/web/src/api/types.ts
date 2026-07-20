@@ -17,6 +17,8 @@ export interface StorageHealthResponse {
 
 export type UserRole = "admin" | "editor";
 export type ContentSourceKind = "rss" | "website" | "instagram" | "manual";
+export type DraftStatus =
+  "draft" | "in_review" | "approved" | "scheduled" | "published" | "archived";
 
 export interface AuthSessionUserResponse {
   sub: string;
@@ -113,6 +115,50 @@ export interface IngestedItemResponse {
 
 export interface InboxItemsResponse {
   items: IngestedItemResponse[];
+}
+
+export interface DraftResponse {
+  id: number;
+  source_item_id: number | null;
+  caption_en: string;
+  caption_zh: string;
+  status: DraftStatus;
+  rendered_post_asset_ref: string | null;
+  rendered_reel_asset_ref: string | null;
+  created_by_sub: string | null;
+  updated_by_sub: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DraftsResponse {
+  drafts: DraftResponse[];
+}
+
+export interface CreateDraftRequest {
+  source_item_id?: number;
+  manual_topic?: string;
+  manual_notes?: string;
+}
+
+export interface UpdateDraftRequest {
+  source_item_id?: number | null;
+  caption_en?: string;
+  caption_zh?: string;
+  status?: DraftStatus;
+  rendered_post_asset_ref?: string | null;
+  rendered_reel_asset_ref?: string | null;
+}
+
+export interface RegenerateDraftRequest {
+  manual_topic?: string;
+  manual_notes?: string;
+}
+
+export interface RenderDraftResponse {
+  draft: DraftResponse;
+  post_asset_ref: string;
+  reel_asset_ref: string;
 }
 
 export interface ApiErrorPayload {

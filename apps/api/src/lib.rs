@@ -1,7 +1,9 @@
 pub mod auth;
+pub mod claude;
 pub mod config;
 pub mod cors;
 pub mod db;
+pub mod drafting;
 pub mod drafts;
 pub mod email;
 pub mod error;

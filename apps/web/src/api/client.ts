@@ -8,6 +8,7 @@ import type {
   BackupContentItemResponse,
   CalendarResponse,
   CalendarSlotResponse,
+  ConnectInstagramRequest,
   CreateBackupContentItemRequest,
   CreateDraftRequest,
   CreateSourceRequest,
@@ -17,6 +18,7 @@ import type {
   DraftsResponse,
   HealthResponse,
   InboxItemsResponse,
+  InstagramStatusResponse,
   RegenerateDraftRequest,
   RenderDraftResponse,
   SourceResponse,
@@ -170,6 +172,19 @@ export const apiClient = {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(assignment),
+    }),
+  getInstagramStatus: () => request<InstagramStatusResponse>("/api/settings/instagram"),
+  connectInstagram: (connection: ConnectInstagramRequest) =>
+    request<InstagramStatusResponse>("/api/settings/instagram/connect", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(connection),
+    }),
+  disconnectInstagram: () =>
+    request<InstagramStatusResponse>("/api/settings/instagram/disconnect", {
+      method: "POST",
     }),
 };
 

@@ -18,6 +18,7 @@ export interface StorageHealthResponse {
 export type UserRole = "admin" | "editor";
 export type ContentSourceKind = "rss" | "website" | "instagram" | "manual";
 export type BackupContentKind = "past_recap" | "did_you_know";
+export type InstagramAccountType = "business" | "creator";
 export type DraftStatus =
   "draft" | "in_review" | "approved" | "rejected" | "scheduled" | "published" | "archived";
 
@@ -219,6 +220,34 @@ export interface AssignCalendarSlotRequest {
   slot_date: string;
   slot_time?: string;
   draft_id: number;
+}
+
+export interface InstagramConnectionResponse {
+  instagram_account_id: string;
+  username: string | null;
+  account_type: InstagramAccountType;
+  graph_api_version: string;
+  app_id: string;
+  token_source: string;
+  token_configured: boolean;
+  connected_by_sub: string | null;
+  disconnected_at: string | null;
+  connected_at: string;
+  updated_at: string;
+}
+
+export interface InstagramStatusResponse {
+  configured: boolean;
+  token_available: boolean;
+  env_account_available: boolean;
+  connected: boolean;
+  account: InstagramConnectionResponse | null;
+}
+
+export interface ConnectInstagramRequest {
+  instagram_account_id?: string;
+  username?: string;
+  account_type?: InstagramAccountType;
 }
 
 export interface ApiErrorPayload {

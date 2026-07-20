@@ -15,10 +15,8 @@ use api::{
     ingestion,
     instagram::{InstagramAccountType, InstagramConnection, NewInstagramConnection},
     invites::{self, AcceptInviteError, UserInvite},
-    publishing::{
-        InstagramPublishInput, InstagramPublishTarget, InstagramPublisher, NewPublishLog,
-        PublishLog, PublishLogStatus,
-    },
+    publisher_scheduler,
+    publishing::{InstagramPublishTarget, InstagramPublisher, PublishLog, PublishLogStatus},
     schedule::{self, NewScheduleAssignment, ScheduleSlot},
     sources::{
         ContentSource, ContentSourceKind, IngestedItem, NewContentSource, UpdateContentSource,
@@ -441,8 +439,16 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let publisher = InstagramPublisher::new();
     let _ingestion_job = ingestion::spawn_ingestion_job(pool.clone(), storage.clone())
         .context("failed to start scheduled ingestion job")?;
+    let _publisher_job = publisher_scheduler::spawn_scheduled_publisher_job(
+        pool.clone(),
+        storage.clone(),
+        email.clone(),
+        publisher.clone(),
+    )
+    .context("failed to start scheduled publisher job")?;
 
     let bind_addr = config.server.bind_addr()?;
     let listener = TcpListener::bind(bind_addr)
@@ -451,10 +457,13 @@ async fn main() -> Result<()> {
 
     info!("api listening on {bind_addr}");
 
-    axum::serve(listener, app(pool, storage, auth, email, drafting, config))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("api server failed")?;
+    axum::serve(
+        listener,
+        app(pool, storage, auth, email, drafting, publisher, config),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("api server failed")?;
 
     Ok(())
 }
@@ -465,6 +474,7 @@ fn app(
     auth: Option<AuthService>,
     email: Option<EmailService>,
     drafting: Option<DraftingService>,
+    publisher: InstagramPublisher,
     config: AppConfig,
 ) -> Router {
     let state = AppState {
@@ -474,7 +484,7 @@ fn app(
         email,
         instagram: config.instagram.clone(),
         drafting,
-        publisher: InstagramPublisher::new(),
+        publisher,
         self_url: config.server.self_url.clone(),
     };
 
@@ -1266,83 +1276,22 @@ async fn publish_draft(
         .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
     let target = payload.target.unwrap_or(InstagramPublishTarget::Post);
     let connection = active_instagram_connection(&state).await?;
-    let asset_ref = publish_asset_ref(&draft, target)?;
-    let media_url = storage
-        .public_url_for_stored_key(asset_ref)
-        .map_err(publishing_error)?;
-    let caption = instagram_caption(&draft);
-    let publish_input = InstagramPublishInput {
-        instagram_account_id: connection.instagram_account_id.clone(),
-        access_token: connection.access_token.clone(),
-        graph_api_version: connection.graph_api_version.clone(),
+    let published = api::publishing::publish_draft_to_instagram(
+        &state.db,
+        storage,
+        &state.publisher,
+        &draft,
+        &connection,
         target,
-        media_url,
-        caption,
-    };
+        Some(&authenticated.user.sub),
+    )
+    .await
+    .map_err(publishing_error)?;
 
-    match state.publisher.publish(&publish_input).await {
-        Ok(success) => {
-            let log = api::publishing::create_publish_log(
-                &state.db,
-                &NewPublishLog {
-                    draft_id: draft.id,
-                    target,
-                    status: PublishLogStatus::Success,
-                    instagram_account_id: connection.instagram_account_id,
-                    asset_ref: asset_ref.to_owned(),
-                    graph_container_id: Some(success.graph_container_id),
-                    graph_media_id: Some(success.graph_media_id),
-                    error_message: None,
-                    requested_by_sub: Some(authenticated.user.sub.clone()),
-                },
-            )
-            .await
-            .map_err(publishing_error)?;
-            let update = UpdatePostDraft {
-                source_item_id: None,
-                caption_en: None,
-                caption_zh: None,
-                status: Some(DraftStatus::Published),
-                rendered_post_asset_ref: None,
-                rendered_reel_asset_ref: None,
-                updated_by_sub: Some(authenticated.user.sub),
-            };
-            let updated = api::drafts::update_post_draft(&state.db, draft.id, &update)
-                .await
-                .map_err(draft_write_error)?
-                .ok_or_else(|| ApiError::not_found_message("draft was not found"))?;
-
-            Ok(Json(PublishDraftResponse {
-                draft: DraftResponse::from(updated),
-                log: PublishLogResponse::from(log),
-            }))
-        }
-        Err(error) => {
-            let message = error
-                .chain()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(": ");
-            let _failure_log = api::publishing::create_publish_log(
-                &state.db,
-                &NewPublishLog {
-                    draft_id: draft.id,
-                    target,
-                    status: PublishLogStatus::Failure,
-                    instagram_account_id: connection.instagram_account_id,
-                    asset_ref: asset_ref.to_owned(),
-                    graph_container_id: None,
-                    graph_media_id: None,
-                    error_message: Some(message.clone()),
-                    requested_by_sub: Some(authenticated.user.sub),
-                },
-            )
-            .await
-            .map_err(publishing_error)?;
-
-            Err(publishing_error(anyhow::anyhow!(message)))
-        }
-    }
+    Ok(Json(PublishDraftResponse {
+        draft: DraftResponse::from(published.draft),
+        log: PublishLogResponse::from(published.log),
+    }))
 }
 
 async fn list_publish_logs(
@@ -1636,28 +1585,6 @@ async fn active_instagram_connection(state: &AppState) -> Result<InstagramConnec
     }
 
     Ok(connection)
-}
-
-fn publish_asset_ref(draft: &PostDraft, target: InstagramPublishTarget) -> Result<&str, ApiError> {
-    if !matches!(draft.status, DraftStatus::Approved | DraftStatus::Scheduled) {
-        return Err(ApiError::bad_request(
-            "only approved or scheduled drafts can be published",
-        ));
-    }
-
-    let asset_ref = match target {
-        InstagramPublishTarget::Post => draft.rendered_post_asset_ref.as_deref(),
-        InstagramPublishTarget::Reel => draft.rendered_reel_asset_ref.as_deref(),
-    };
-
-    asset_ref
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::bad_request("draft must have a rendered asset before publishing"))
-}
-
-fn instagram_caption(draft: &PostDraft) -> String {
-    format!("{}\n\n{}", draft.caption_en.trim(), draft.caption_zh.trim())
 }
 
 async fn draft_generation_input(

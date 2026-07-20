@@ -4,6 +4,12 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Type};
 
+use crate::{
+    drafts::{self, DraftStatus, PostDraft, UpdatePostDraft},
+    instagram::InstagramConnection,
+    storage::ObjectStorage,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "instagram_publish_target", rename_all = "snake_case")]
@@ -68,6 +74,12 @@ pub struct InstagramPublishInput {
 pub struct InstagramPublishSuccess {
     pub graph_container_id: String,
     pub graph_media_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedDraft {
+    pub draft: PostDraft,
+    pub log: PublishLog,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,6 +219,108 @@ pub async fn list_publish_logs_for_draft(pool: &PgPool, draft_id: i64) -> Result
     .fetch_all(pool)
     .await
     .with_context(|| format!("failed to list publish logs for draft `{draft_id}`"))
+}
+
+pub async fn publish_draft_to_instagram(
+    pool: &PgPool,
+    storage: &ObjectStorage,
+    publisher: &InstagramPublisher,
+    draft: &PostDraft,
+    connection: &InstagramConnection,
+    target: InstagramPublishTarget,
+    requested_by_sub: Option<&str>,
+) -> Result<PublishedDraft> {
+    let asset_ref = publish_asset_ref(draft, target)?;
+    let media_url = storage.public_url_for_stored_key(asset_ref)?;
+    let publish_input = InstagramPublishInput {
+        instagram_account_id: connection.instagram_account_id.clone(),
+        access_token: connection.access_token.clone(),
+        graph_api_version: connection.graph_api_version.clone(),
+        target,
+        media_url,
+        caption: instagram_caption(draft),
+    };
+
+    match publisher.publish(&publish_input).await {
+        Ok(success) => {
+            let log = create_publish_log(
+                pool,
+                &NewPublishLog {
+                    draft_id: draft.id,
+                    target,
+                    status: PublishLogStatus::Success,
+                    instagram_account_id: connection.instagram_account_id.clone(),
+                    asset_ref: asset_ref.to_owned(),
+                    graph_container_id: Some(success.graph_container_id),
+                    graph_media_id: Some(success.graph_media_id),
+                    error_message: None,
+                    requested_by_sub: requested_by_sub.map(ToOwned::to_owned),
+                },
+            )
+            .await?;
+            let update = UpdatePostDraft {
+                source_item_id: None,
+                caption_en: None,
+                caption_zh: None,
+                status: Some(DraftStatus::Published),
+                rendered_post_asset_ref: None,
+                rendered_reel_asset_ref: None,
+                updated_by_sub: requested_by_sub.map(ToOwned::to_owned),
+            };
+            let updated = drafts::update_post_draft(pool, draft.id, &update)
+                .await?
+                .context("draft was not found")?;
+
+            Ok(PublishedDraft {
+                draft: updated,
+                log,
+            })
+        }
+        Err(error) => {
+            let message = error
+                .chain()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(": ");
+            create_publish_log(
+                pool,
+                &NewPublishLog {
+                    draft_id: draft.id,
+                    target,
+                    status: PublishLogStatus::Failure,
+                    instagram_account_id: connection.instagram_account_id.clone(),
+                    asset_ref: asset_ref.to_owned(),
+                    graph_container_id: None,
+                    graph_media_id: None,
+                    error_message: Some(message.clone()),
+                    requested_by_sub: requested_by_sub.map(ToOwned::to_owned),
+                },
+            )
+            .await?;
+
+            anyhow::bail!(message);
+        }
+    }
+}
+
+pub fn publish_asset_ref(draft: &PostDraft, target: InstagramPublishTarget) -> Result<&str> {
+    if !matches!(draft.status, DraftStatus::Approved | DraftStatus::Scheduled) {
+        anyhow::bail!("only approved or scheduled drafts can be published");
+    }
+
+    let asset_ref = match target {
+        InstagramPublishTarget::Post => draft.rendered_post_asset_ref.as_deref(),
+        InstagramPublishTarget::Reel => draft.rendered_reel_asset_ref.as_deref(),
+    };
+
+    asset_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("draft must have a rendered asset before publishing")
+}
+
+pub fn instagram_caption(draft: &PostDraft) -> String {
+    format!("{}\n\n{}", draft.caption_en.trim(), draft.caption_zh.trim())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

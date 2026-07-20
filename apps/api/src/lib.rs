@@ -10,6 +10,7 @@ pub mod email;
 pub mod error;
 pub mod ingestion;
 pub mod instagram;
+pub mod insights;
 pub mod invites;
 pub mod publisher_scheduler;
 pub mod publishing;

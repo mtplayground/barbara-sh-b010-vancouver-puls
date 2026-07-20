@@ -8,6 +8,7 @@ const navigationItems = [
   { label: "Inbox", to: "/inbox" },
   { label: "Drafts", to: "/drafts" },
   { label: "Calendar", to: "/calendar" },
+  { label: "Backup", to: "/backup-library" },
   { label: "Users", to: "/users", adminOnly: true },
   { label: "Settings", to: "/settings" },
 ];

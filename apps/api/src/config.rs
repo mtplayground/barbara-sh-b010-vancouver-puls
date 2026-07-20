@@ -41,6 +41,7 @@ pub struct ObjectStorageConfig {
 pub struct EmailConfig {
     pub url: String,
     pub app_token: String,
+    pub operator_alert_email: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +121,7 @@ impl AppConfig {
             object_storage_prefix_configured = object_storage.prefix_configured,
             email_url_configured = email.url_configured,
             email_token_configured = email.token_configured,
+            operator_alert_email_configured = email.operator_alert_email_configured,
             auth_url_configured = auth.url_configured,
             auth_token_configured = auth.token_configured,
             auth_jwks_configured = auth.jwks_configured,
@@ -150,6 +152,7 @@ struct ObjectStorageSummary {
 struct EmailSummary {
     url_configured: bool,
     token_configured: bool,
+    operator_alert_email_configured: bool,
 }
 
 #[derive(Debug, Default)]
@@ -247,7 +250,11 @@ impl ObjectStorageConfig {
 
 impl EmailConfig {
     fn from_env() -> Result<Option<Self>> {
-        let names = ["MCTAI_EMAIL_URL", "MCTAI_EMAIL_APP_TOKEN"];
+        let names = [
+            "MCTAI_EMAIL_URL",
+            "MCTAI_EMAIL_APP_TOKEN",
+            "OPERATOR_ALERT_EMAIL",
+        ];
 
         if !any_var_present(&names)? {
             return Ok(None);
@@ -256,6 +263,7 @@ impl EmailConfig {
         Ok(Some(Self {
             url: required_var("MCTAI_EMAIL_URL")?,
             app_token: required_var("MCTAI_EMAIL_APP_TOKEN")?,
+            operator_alert_email: optional_var("OPERATOR_ALERT_EMAIL")?,
         }))
     }
 
@@ -263,6 +271,7 @@ impl EmailConfig {
         EmailSummary {
             url_configured: !self.url.is_empty(),
             token_configured: !self.app_token.is_empty(),
+            operator_alert_email_configured: self.operator_alert_email.is_some(),
         }
     }
 }

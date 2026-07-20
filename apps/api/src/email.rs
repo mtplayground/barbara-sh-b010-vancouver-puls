@@ -57,6 +57,21 @@ impl EmailService {
             .await
     }
 
+    pub fn operator_alert_email(&self) -> Option<&str> {
+        self.config.operator_alert_email.as_deref()
+    }
+
+    pub async fn send_publisher_alert(
+        &self,
+        to: &str,
+        subject: &str,
+        message: &str,
+    ) -> Result<EmailDelivery, EmailSendError> {
+        let html = format!("<p>{}</p>", escape_html(message).replace('\n', "<br>"));
+
+        self.send_email(to, subject, &html, message).await
+    }
+
     async fn send_email(
         &self,
         to: &str,

@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 
-use crate::{drafts::PostDraft, storage::ObjectStorage};
+use crate::{
+    drafts::PostDraft,
+    retry::{is_transient_external_error, retry_transient, STORAGE_RETRY},
+    storage::ObjectStorage,
+};
 
 const SVG_CONTENT_TYPE: &str = "image/svg+xml; charset=utf-8";
 
@@ -23,24 +27,50 @@ pub async fn render_and_store_draft_assets(
     let reel_key = format!("rendered/drafts/{}/{version}/reel.svg", draft.id);
     let post_svg = render_post_svg(draft);
     let reel_svg = render_reel_svg(draft);
-    let post_object = storage
-        .put_bytes(&post_key, post_svg.into_bytes(), Some(SVG_CONTENT_TYPE))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to store rendered post asset for draft `{}`",
-                draft.id
-            )
-        })?;
-    let reel_object = storage
-        .put_bytes(&reel_key, reel_svg.into_bytes(), Some(SVG_CONTENT_TYPE))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to store rendered reel asset for draft `{}`",
-                draft.id
-            )
-        })?;
+    let post_bytes = post_svg.into_bytes();
+    let reel_bytes = reel_svg.into_bytes();
+    let post_object = retry_transient(
+        STORAGE_RETRY,
+        "store rendered post asset",
+        |_| {
+            let post_bytes = post_bytes.clone();
+            let post_key = post_key.clone();
+            async move {
+                storage
+                    .put_bytes(&post_key, post_bytes, Some(SVG_CONTENT_TYPE))
+                    .await
+            }
+        },
+        is_transient_external_error,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to store rendered post asset for draft `{}`",
+            draft.id
+        )
+    })?;
+    let reel_object = retry_transient(
+        STORAGE_RETRY,
+        "store rendered reel asset",
+        |_| {
+            let reel_bytes = reel_bytes.clone();
+            let reel_key = reel_key.clone();
+            async move {
+                storage
+                    .put_bytes(&reel_key, reel_bytes, Some(SVG_CONTENT_TYPE))
+                    .await
+            }
+        },
+        is_transient_external_error,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "failed to store rendered reel asset for draft `{}`",
+            draft.id
+        )
+    })?;
 
     Ok(RenderedDraftAssets {
         post_asset_ref: post_object.key,

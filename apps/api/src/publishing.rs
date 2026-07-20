@@ -7,6 +7,10 @@ use sqlx::{FromRow, PgPool, Type};
 use crate::{
     drafts::{self, DraftStatus, PostDraft, UpdatePostDraft},
     instagram::InstagramConnection,
+    retry::{
+        is_retryable_status_code, is_transient_external_error, retry_transient,
+        EXTERNAL_HTTP_RETRY,
+    },
     storage::ObjectStorage,
 };
 
@@ -111,31 +115,48 @@ impl InstagramPublisher {
             "media",
         )?;
         let container_params = media_container_params(&normalized);
-        let container = self
-            .client
-            .post(container_url)
-            .form(&container_params)
-            .send()
-            .await
-            .context("failed to create Instagram media container")?;
-        let container = graph_json_response(container, "media container").await?;
+        let container = retry_transient(
+            EXTERNAL_HTTP_RETRY,
+            "create Instagram media container",
+            |_| async {
+                let response = self
+                    .client
+                    .post(&container_url)
+                    .form(&container_params)
+                    .send()
+                    .await
+                    .context("failed to create Instagram media container")?;
+                graph_json_response(response, "media container").await
+            },
+            is_transient_external_error,
+        )
+        .await?;
         let publish_url = graph_endpoint(
             &self.graph_base_url,
             &normalized.graph_api_version,
             &normalized.instagram_account_id,
             "media_publish",
         )?;
-        let publish = self
-            .client
-            .post(publish_url)
-            .form(&[
-                ("creation_id", container.id.as_str()),
-                ("access_token", normalized.access_token.as_str()),
-            ])
-            .send()
-            .await
-            .context("failed to publish Instagram media container")?;
-        let published = graph_json_response(publish, "media publish").await?;
+        let publish_params = [
+            ("creation_id", container.id.as_str()),
+            ("access_token", normalized.access_token.as_str()),
+        ];
+        let published = retry_transient(
+            EXTERNAL_HTTP_RETRY,
+            "publish Instagram media container",
+            |_| async {
+                let response = self
+                    .client
+                    .post(&publish_url)
+                    .form(&publish_params)
+                    .send()
+                    .await
+                    .context("failed to publish Instagram media container")?;
+                graph_json_response(response, "media publish").await
+            },
+            is_transient_external_error,
+        )
+        .await?;
 
         Ok(InstagramPublishSuccess {
             graph_container_id: container.id,
@@ -467,12 +488,17 @@ async fn graph_json_response(response: reqwest::Response, action: &str) -> Resul
     let status = response.status();
 
     if !status.is_success() {
+        let failure_kind = if is_retryable_status_code(status) {
+            "transient"
+        } else {
+            "permanent"
+        };
         let error_body = response
             .text()
             .await
             .unwrap_or_else(|_| "response body unavailable".to_owned());
         anyhow::bail!(
-            "Instagram Graph API {action} request failed with status {}: {}",
+            "Instagram Graph API {action} request failed with {failure_kind} status {}: {}",
             status_for_log(status),
             truncate_error(&error_body)
         );
@@ -530,6 +556,7 @@ mod tests {
         graph_endpoint, media_container_params, InstagramPublishInput, InstagramPublishTarget,
         NewPublishLog, PublishLogStatus, ValidatedInstagramPublishInput, ValidatedPublishLog,
     };
+    use crate::retry::is_transient_external_error;
 
     #[test]
     fn post_publish_params_use_image_url_without_token_in_url() {
@@ -652,5 +679,18 @@ mod tests {
         };
 
         assert!(error.to_string().contains("error message"));
+    }
+
+    #[test]
+    fn graph_transient_status_errors_are_retryable() {
+        let transient = anyhow::anyhow!(
+            "Instagram Graph API media container request failed with transient status 503: unavailable"
+        );
+        let permanent = anyhow::anyhow!(
+            "Instagram Graph API media container request failed with permanent status 400: bad request"
+        );
+
+        assert!(is_transient_external_error(&transient));
+        assert!(!is_transient_external_error(&permanent));
     }
 }

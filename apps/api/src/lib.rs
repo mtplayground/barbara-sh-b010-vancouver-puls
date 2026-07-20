@@ -15,6 +15,7 @@ pub mod invites;
 pub mod publisher_scheduler;
 pub mod publishing;
 pub mod rendering;
+pub mod retry;
 pub mod schedule;
 pub mod sources;
 pub mod storage;

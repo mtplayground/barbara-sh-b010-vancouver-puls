@@ -30,7 +30,12 @@ impl DraftStatus {
             ) => true,
             (
                 Self::Approved,
-                Self::Draft | Self::InReview | Self::Approved | Self::Rejected | Self::Scheduled,
+                Self::Draft
+                | Self::InReview
+                | Self::Approved
+                | Self::Rejected
+                | Self::Scheduled
+                | Self::Published,
             ) => true,
             (Self::Scheduled, Self::Published | Self::Archived) => true,
             (Self::Published, Self::Archived) => true,

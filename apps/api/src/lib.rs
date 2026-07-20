@@ -11,6 +11,7 @@ pub mod error;
 pub mod ingestion;
 pub mod instagram;
 pub mod invites;
+pub mod publishing;
 pub mod rendering;
 pub mod schedule;
 pub mod sources;

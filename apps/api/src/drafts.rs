@@ -10,6 +10,7 @@ pub enum DraftStatus {
     Draft,
     InReview,
     Approved,
+    Rejected,
     Scheduled,
     Published,
     Archived,
@@ -18,6 +19,27 @@ pub enum DraftStatus {
 impl DraftStatus {
     pub fn is_editable(self) -> bool {
         matches!(self, Self::Draft | Self::InReview | Self::Approved)
+    }
+
+    pub fn can_transition_to(self, next: Self) -> bool {
+        match (self, next) {
+            (current, next) if current == next => true,
+            (
+                Self::Draft | Self::InReview,
+                Self::Draft | Self::InReview | Self::Approved | Self::Rejected,
+            ) => true,
+            (
+                Self::Approved,
+                Self::Draft | Self::InReview | Self::Approved | Self::Rejected | Self::Scheduled,
+            ) => true,
+            (Self::Scheduled, Self::Published | Self::Archived) => true,
+            (Self::Published, Self::Archived) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Rejected | Self::Archived)
     }
 }
 
@@ -242,7 +264,7 @@ impl ValidatedPostDraftInput {
                 .caption_zh
                 .as_deref()
                 .unwrap_or(existing.caption_zh.as_str()),
-            update.status.unwrap_or(existing.status),
+            validate_status_transition(existing, update.status.unwrap_or(existing.status))?,
             match &update.rendered_post_asset_ref {
                 Some(value) => trimmed_optional(value.as_deref()),
                 None => existing.rendered_post_asset_ref.clone(),
@@ -288,6 +310,32 @@ fn validate_draft_input(
     })
 }
 
+fn validate_status_transition(
+    existing: &PostDraft,
+    next_status: DraftStatus,
+) -> Result<DraftStatus> {
+    if !existing.status.can_transition_to(next_status) {
+        anyhow::bail!(
+            "draft status cannot transition from {:?} to {:?}",
+            existing.status,
+            next_status
+        );
+    }
+
+    if next_status == DraftStatus::Approved
+        && (existing.rendered_post_asset_ref.is_none()
+            || existing.rendered_reel_asset_ref.is_none())
+    {
+        anyhow::bail!("draft must have rendered post and reel assets before approval");
+    }
+
+    if next_status == DraftStatus::Scheduled && existing.status != DraftStatus::Approved {
+        anyhow::bail!("only approved drafts are schedulable");
+    }
+
+    Ok(next_status)
+}
+
 fn trimmed_optional(value: Option<&str>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
@@ -305,9 +353,21 @@ mod tests {
         assert!(DraftStatus::Draft.is_editable());
         assert!(DraftStatus::InReview.is_editable());
         assert!(DraftStatus::Approved.is_editable());
+        assert!(!DraftStatus::Rejected.is_editable());
         assert!(!DraftStatus::Scheduled.is_editable());
         assert!(!DraftStatus::Published.is_editable());
         assert!(!DraftStatus::Archived.is_editable());
+    }
+
+    #[test]
+    fn status_transitions_match_approval_workflow() {
+        assert!(DraftStatus::Draft.can_transition_to(DraftStatus::Approved));
+        assert!(DraftStatus::InReview.can_transition_to(DraftStatus::Rejected));
+        assert!(DraftStatus::Approved.can_transition_to(DraftStatus::Scheduled));
+        assert!(!DraftStatus::Draft.can_transition_to(DraftStatus::Scheduled));
+        assert!(!DraftStatus::Rejected.can_transition_to(DraftStatus::Approved));
+        assert!(DraftStatus::Rejected.is_terminal());
+        assert!(DraftStatus::Archived.is_terminal());
     }
 
     #[test]
@@ -319,7 +379,7 @@ mod tests {
             caption_zh: "中文".to_owned(),
             status: DraftStatus::Draft,
             rendered_post_asset_ref: Some("rendered/post.png".to_owned()),
-            rendered_reel_asset_ref: None,
+            rendered_reel_asset_ref: Some("rendered/reel.png".to_owned()),
             created_by_sub: Some("user-1".to_owned()),
             updated_by_sub: Some("user-1".to_owned()),
             created_at: Utc::now(),
@@ -371,5 +431,71 @@ mod tests {
             };
 
         assert!(error.to_string().contains("English caption"));
+    }
+
+    #[test]
+    fn approval_requires_rendered_assets() {
+        let existing = PostDraft {
+            id: 10,
+            source_item_id: None,
+            caption_en: "English".to_owned(),
+            caption_zh: "中文".to_owned(),
+            status: DraftStatus::Draft,
+            rendered_post_asset_ref: Some("rendered/post.png".to_owned()),
+            rendered_reel_asset_ref: None,
+            created_by_sub: Some("user-1".to_owned()),
+            updated_by_sub: Some("user-1".to_owned()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let update = UpdatePostDraft {
+            source_item_id: None,
+            caption_en: None,
+            caption_zh: None,
+            status: Some(DraftStatus::Approved),
+            rendered_post_asset_ref: None,
+            rendered_reel_asset_ref: None,
+            updated_by_sub: Some("user-2".to_owned()),
+        };
+
+        let error = match ValidatedPostDraftInput::from_update(&existing, &update) {
+            Ok(_) => panic!("approval without both rendered assets should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("rendered post and reel assets"));
+    }
+
+    #[test]
+    fn only_approved_drafts_can_be_scheduled() {
+        let existing = PostDraft {
+            id: 10,
+            source_item_id: None,
+            caption_en: "English".to_owned(),
+            caption_zh: "中文".to_owned(),
+            status: DraftStatus::Draft,
+            rendered_post_asset_ref: Some("rendered/post.png".to_owned()),
+            rendered_reel_asset_ref: Some("rendered/reel.png".to_owned()),
+            created_by_sub: Some("user-1".to_owned()),
+            updated_by_sub: Some("user-1".to_owned()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let update = UpdatePostDraft {
+            source_item_id: None,
+            caption_en: None,
+            caption_zh: None,
+            status: Some(DraftStatus::Scheduled),
+            rendered_post_asset_ref: None,
+            rendered_reel_asset_ref: None,
+            updated_by_sub: Some("user-2".to_owned()),
+        };
+
+        let error = match ValidatedPostDraftInput::from_update(&existing, &update) {
+            Ok(_) => panic!("draft should not schedule before approval"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Draft to Scheduled"));
     }
 }

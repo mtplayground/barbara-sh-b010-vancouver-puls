@@ -95,6 +95,13 @@ impl InstagramPublisher {
         }
     }
 
+    pub fn with_graph_base_url(graph_base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            graph_base_url: graph_base_url.into(),
+        }
+    }
+
     pub async fn publish(&self, input: &InstagramPublishInput) -> Result<InstagramPublishSuccess> {
         let normalized = ValidatedInstagramPublishInput::from_input(input)?;
         let container_url = graph_endpoint(

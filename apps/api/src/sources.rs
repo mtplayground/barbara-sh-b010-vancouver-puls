@@ -310,6 +310,32 @@ pub async fn find_ingested_item_by_dedup_key_any_source(
     .with_context(|| format!("failed to find ingested item by dedup key `{dedup_key}`"))
 }
 
+pub async fn find_ingested_item(pool: &PgPool, item_id: i64) -> Result<Option<IngestedItem>> {
+    sqlx::query_as::<_, IngestedItem>(
+        r#"
+        SELECT
+            id,
+            source_id,
+            title,
+            summary,
+            link,
+            media_ref,
+            dedup_key,
+            source_published_at,
+            discovered_at,
+            ingested_at,
+            updated_at
+        FROM ingested_items
+        WHERE id = $1
+        "#,
+    )
+    .bind(item_id)
+    .persistent(false)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to find ingested item `{item_id}`"))
+}
+
 pub async fn list_recent_ingested_items(pool: &PgPool, limit: i64) -> Result<Vec<IngestedItem>> {
     let bounded_limit = limit.clamp(1, 100);
 

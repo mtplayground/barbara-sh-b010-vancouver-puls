@@ -8,7 +8,9 @@ use api::{
     error::ApiError,
     ingestion,
     invites::{self, AcceptInviteError, UserInvite},
-    sources::{ContentSource, ContentSourceKind, NewContentSource, UpdateContentSource},
+    sources::{
+        ContentSource, ContentSourceKind, IngestedItem, NewContentSource, UpdateContentSource,
+    },
     storage::ObjectStorage,
     users::{User, UserRole},
 };
@@ -130,6 +132,31 @@ struct UpdateSourceRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct InboxItemsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct InboxItemsResponse {
+    items: Vec<IngestedItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct IngestedItemResponse {
+    id: i64,
+    source_id: i64,
+    title: String,
+    summary: Option<String>,
+    link: String,
+    media_ref: Option<String>,
+    dedup_key: String,
+    source_published_at: Option<chrono::DateTime<chrono::Utc>>,
+    discovered_at: chrono::DateTime<chrono::Utc>,
+    ingested_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateInviteRequest {
     email: String,
 }
@@ -246,6 +273,7 @@ fn app(
             "/api/admin/sources/:source_id",
             patch(update_source).delete(delete_source),
         )
+        .route("/api/inbox/items", get(list_inbox_items))
         .route(
             "/api/invites/accept",
             get(accept_invite_redirect).post(accept_invite),
@@ -466,6 +494,23 @@ async fn delete_source(
     Ok(Json(SourceResponse::from(source)))
 }
 
+async fn list_inbox_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxItemsQuery>,
+) -> Result<Json<InboxItemsResponse>, ApiError> {
+    require_user(&state, &headers).await?;
+
+    let items = api::sources::list_recent_ingested_items(&state.db, query.limit.unwrap_or(50))
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(IngestedItemResponse::from)
+        .collect();
+
+    Ok(Json(InboxItemsResponse { items }))
+}
+
 async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -682,6 +727,24 @@ impl From<ContentSource> for SourceResponse {
             enabled: source.enabled,
             created_at: source.created_at,
             updated_at: source.updated_at,
+        }
+    }
+}
+
+impl From<IngestedItem> for IngestedItemResponse {
+    fn from(item: IngestedItem) -> Self {
+        Self {
+            id: item.id,
+            source_id: item.source_id,
+            title: item.title,
+            summary: item.summary,
+            link: item.link,
+            media_ref: item.media_ref,
+            dedup_key: item.dedup_key,
+            source_published_at: item.source_published_at,
+            discovered_at: item.discovered_at,
+            ingested_at: item.ingested_at,
+            updated_at: item.updated_at,
         }
     }
 }

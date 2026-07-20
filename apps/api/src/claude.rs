@@ -2,7 +2,10 @@ use anyhow::Result;
 use reqwest::{header::HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ClaudeConfig;
+use crate::{
+    config::ClaudeConfig,
+    retry::{is_retryable_status_code, retry_transient, EXTERNAL_HTTP_RETRY},
+};
 
 pub const CLAUDE_DRAFTING_MODEL: &str = "claude-opus-4-8";
 
@@ -18,6 +21,7 @@ pub struct ClaudeClient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeError {
     RateLimited,
+    Transient(String),
     Failed(String),
 }
 
@@ -64,6 +68,20 @@ impl ClaudeClient {
         system: &str,
         user_prompt: &str,
     ) -> Result<String, ClaudeError> {
+        retry_transient(
+            EXTERNAL_HTTP_RETRY,
+            "Claude text completion",
+            |_| self.complete_text_once(system, user_prompt),
+            is_transient_claude_error,
+        )
+        .await
+    }
+
+    async fn complete_text_once(
+        &self,
+        system: &str,
+        user_prompt: &str,
+    ) -> Result<String, ClaudeError> {
         let response = self
             .client
             .post(ANTHROPIC_MESSAGES_URL)
@@ -84,7 +102,7 @@ impl ClaudeClient {
             })
             .send()
             .await
-            .map_err(|error| ClaudeError::Failed(format!("claude request failed: {error}")))?;
+            .map_err(|error| ClaudeError::Transient(format!("claude request failed: {error}")))?;
 
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             return Err(ClaudeError::RateLimited);
@@ -96,9 +114,13 @@ impl ClaudeClient {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("failed to read error response: {error}"));
-            return Err(ClaudeError::Failed(format!(
-                "claude request failed with status {status}: {body}"
-            )));
+            let message = format!("claude request failed with status {status}: {body}");
+
+            if is_retryable_status_code(status) {
+                return Err(ClaudeError::Transient(message));
+            }
+
+            return Err(ClaudeError::Failed(message));
         }
 
         let body = response
@@ -117,8 +139,13 @@ impl ClaudeClient {
 pub fn claude_error_to_anyhow(error: ClaudeError) -> anyhow::Error {
     match error {
         ClaudeError::RateLimited => anyhow::anyhow!("claude request rate limited"),
+        ClaudeError::Transient(message) => anyhow::anyhow!(message),
         ClaudeError::Failed(message) => anyhow::anyhow!(message),
     }
+}
+
+fn is_transient_claude_error(error: &ClaudeError) -> bool {
+    matches!(error, ClaudeError::RateLimited | ClaudeError::Transient(_))
 }
 
 fn first_text_block(response: ClaudeMessagesResponse) -> Option<String> {
@@ -146,7 +173,7 @@ pub fn parse_text_response(raw: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_text_response;
+    use super::{is_transient_claude_error, parse_text_response, ClaudeError};
 
     #[test]
     fn strips_json_code_fence_from_response() -> anyhow::Result<()> {
@@ -161,5 +188,16 @@ mod tests {
     #[test]
     fn rejects_empty_text_response() {
         assert!(parse_text_response("   ").is_err());
+    }
+
+    #[test]
+    fn classifies_only_retryable_claude_errors_as_transient() {
+        assert!(is_transient_claude_error(&ClaudeError::RateLimited));
+        assert!(is_transient_claude_error(&ClaudeError::Transient(
+            "status 503".to_owned()
+        )));
+        assert!(!is_transient_claude_error(&ClaudeError::Failed(
+            "parse failed".to_owned()
+        )));
     }
 }

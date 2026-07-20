@@ -11,6 +11,10 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::{
+    retry::{
+        is_retryable_status_code, is_transient_external_error, retry_transient,
+        EXTERNAL_HTTP_RETRY, STORAGE_RETRY,
+    },
     sources::{self, ContentSource, ContentSourceKind, NewIngestedItem},
     storage::ObjectStorage,
 };
@@ -172,12 +176,20 @@ impl IngestionService {
     }
 
     async fn fetch_text(&self, url: &str) -> Result<String> {
-        let response = self.http.get(url).send().await?;
-        ensure_success(response.status(), url)?;
-        response
-            .text()
-            .await
-            .context("failed to read response body")
+        retry_transient(
+            EXTERNAL_HTTP_RETRY,
+            "fetch ingestion source",
+            |_| async {
+                let response = self.http.get(url).send().await?;
+                ensure_success(response.status(), url)?;
+                response
+                    .text()
+                    .await
+                    .context("failed to read response body")
+            },
+            is_transient_external_error,
+        )
+        .await
     }
 
     async fn cache_media_if_available(
@@ -199,9 +211,23 @@ impl IngestionService {
                     source_id,
                     media_cache_key(media_url, &media.bytes)
                 );
-                match storage
-                    .put_bytes(&key, media.bytes, media.content_type.as_deref())
-                    .await
+                let bytes = media.bytes;
+                match retry_transient(
+                    STORAGE_RETRY,
+                    "cache source media",
+                    |_| {
+                        let bytes = bytes.clone();
+                        let key = key.clone();
+                        let content_type = media.content_type.clone();
+                        async move {
+                            storage
+                                .put_bytes(&key, bytes, content_type.as_deref())
+                                .await
+                        }
+                    },
+                    is_transient_external_error,
+                )
+                .await
                 {
                     Ok(stored) => (Some(stored.key), true),
                     Err(error) => {
@@ -228,26 +254,34 @@ impl IngestionService {
     }
 
     async fn fetch_media(&self, media_url: &str) -> Result<FetchedMedia> {
-        let response = self.http.get(media_url).send().await?;
-        ensure_success(response.status(), media_url)?;
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let bytes = response
-            .bytes()
-            .await
-            .context("failed to read media response body")?;
+        retry_transient(
+            EXTERNAL_HTTP_RETRY,
+            "fetch source media",
+            |_| async {
+                let response = self.http.get(media_url).send().await?;
+                ensure_success(response.status(), media_url)?;
+                let content_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let bytes = response
+                    .bytes()
+                    .await
+                    .context("failed to read media response body")?;
 
-        if bytes.len() > MAX_MEDIA_BYTES {
-            anyhow::bail!("media response exceeded {} bytes", MAX_MEDIA_BYTES);
-        }
+                if bytes.len() > MAX_MEDIA_BYTES {
+                    anyhow::bail!("media response exceeded {} bytes", MAX_MEDIA_BYTES);
+                }
 
-        Ok(FetchedMedia {
-            bytes: bytes.to_vec(),
-            content_type,
-        })
+                Ok(FetchedMedia {
+                    bytes: bytes.to_vec(),
+                    content_type,
+                })
+            },
+            is_transient_external_error,
+        )
+        .await
     }
 }
 
@@ -572,7 +606,13 @@ fn media_cache_key(media_url: &str, bytes: &[u8]) -> String {
 
 fn ensure_success(status: StatusCode, url: &str) -> Result<()> {
     if !status.is_success() {
-        anyhow::bail!("request to `{url}` failed with status {status}");
+        let failure_kind = if is_retryable_status_code(status) {
+            "transient"
+        } else {
+            "permanent"
+        };
+
+        anyhow::bail!("request to `{url}` failed with {failure_kind} status {status}");
     }
 
     Ok(())

@@ -17,6 +17,7 @@ export interface StorageHealthResponse {
 
 export type UserRole = "admin" | "editor";
 export type ContentSourceKind = "rss" | "website" | "instagram" | "manual";
+export type BackupContentKind = "past_recap" | "did_you_know";
 export type DraftStatus =
   "draft" | "in_review" | "approved" | "rejected" | "scheduled" | "published" | "archived";
 
@@ -115,6 +116,42 @@ export interface IngestedItemResponse {
 
 export interface InboxItemsResponse {
   items: IngestedItemResponse[];
+}
+
+export interface BackupContentItemResponse {
+  id: number;
+  kind: BackupContentKind;
+  title: string;
+  body: string;
+  source_url: string | null;
+  media_ref: string | null;
+  active: boolean;
+  created_by_sub: string | null;
+  updated_by_sub: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BackupContentItemsResponse {
+  items: BackupContentItemResponse[];
+}
+
+export interface CreateBackupContentItemRequest {
+  kind: BackupContentKind;
+  title: string;
+  body: string;
+  source_url?: string | null;
+  media_ref?: string | null;
+  active?: boolean;
+}
+
+export interface UpdateBackupContentItemRequest {
+  kind?: BackupContentKind;
+  title?: string;
+  body?: string;
+  source_url?: string | null;
+  media_ref?: string | null;
+  active?: boolean;
 }
 
 export interface DraftResponse {

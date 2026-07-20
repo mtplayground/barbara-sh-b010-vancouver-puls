@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AppLayout } from "../layout/AppLayout";
+import { BackupLibraryRoute } from "./BackupLibraryRoute";
 import { CalendarRoute } from "./CalendarRoute";
 import { DashboardRoute } from "./DashboardRoute";
 import { DraftsRoute } from "./DraftsRoute";
@@ -20,6 +21,7 @@ export function AppRoutes() {
         <Route path="inbox" element={<InboxRoute />} />
         <Route path="drafts" element={<DraftsRoute />} />
         <Route path="calendar" element={<CalendarRoute />} />
+        <Route path="backup-library" element={<BackupLibraryRoute />} />
         <Route path="users" element={<UsersRoute />} />
         <Route path="settings" element={<SettingsRoute />} />
         <Route path="*" element={<Navigate to="/" replace />} />

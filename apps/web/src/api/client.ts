@@ -4,8 +4,11 @@ import type {
   AdminUsersResponse,
   AssignCalendarSlotRequest,
   AuthSessionResponse,
+  BackupContentItemsResponse,
+  BackupContentItemResponse,
   CalendarResponse,
   CalendarSlotResponse,
+  CreateBackupContentItemRequest,
   CreateDraftRequest,
   CreateSourceRequest,
   CreateInviteResponse,
@@ -19,6 +22,7 @@ import type {
   SourceResponse,
   SourcesResponse,
   StorageHealthResponse,
+  UpdateBackupContentItemRequest,
   UpdateDraftRequest,
   UpdateSourceRequest,
   UserRole,
@@ -84,6 +88,34 @@ export const apiClient = {
     }),
   listInboxItems: (limit = 50) =>
     request<InboxItemsResponse>(`/api/inbox/items?limit=${encodeURIComponent(limit)}`),
+  listBackupContentItems: (limit = 50, active?: boolean) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (active !== undefined) {
+      params.set("active", String(active));
+    }
+
+    return request<BackupContentItemsResponse>(`/api/backup-library?${params.toString()}`);
+  },
+  createBackupContentItem: (item: CreateBackupContentItemRequest) =>
+    request<BackupContentItemResponse>("/api/backup-library", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(item),
+    }),
+  updateBackupContentItem: (id: number, item: UpdateBackupContentItemRequest) =>
+    request<BackupContentItemResponse>(`/api/backup-library/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(item),
+    }),
+  deleteBackupContentItem: (id: number) =>
+    request<BackupContentItemResponse>(`/api/backup-library/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
   listDrafts: (limit = 50) =>
     request<DraftsResponse>(`/api/drafts?limit=${encodeURIComponent(limit)}`),
   getDraft: (id: number) => request<DraftResponse>(`/api/drafts/${encodeURIComponent(id)}`),

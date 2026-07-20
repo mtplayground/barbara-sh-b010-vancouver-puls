@@ -97,6 +97,24 @@ export interface UpdateSourceRequest {
   enabled?: boolean;
 }
 
+export interface IngestedItemResponse {
+  id: number;
+  source_id: number;
+  title: string;
+  summary: string | null;
+  link: string;
+  media_ref: string | null;
+  dedup_key: string;
+  source_published_at: string | null;
+  discovered_at: string;
+  ingested_at: string;
+  updated_at: string;
+}
+
+export interface InboxItemsResponse {
+  items: IngestedItemResponse[];
+}
+
 export interface ApiErrorPayload {
   error: {
     code: string;

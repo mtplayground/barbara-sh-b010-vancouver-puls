@@ -7,6 +7,7 @@ import type {
   CreateInviteResponse,
   DatabaseHealthResponse,
   HealthResponse,
+  InboxItemsResponse,
   SourceResponse,
   SourcesResponse,
   StorageHealthResponse,
@@ -72,6 +73,8 @@ export const apiClient = {
     request<SourceResponse>(`/api/admin/sources/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
+  listInboxItems: (limit = 50) =>
+    request<InboxItemsResponse>(`/api/inbox/items?limit=${encodeURIComponent(limit)}`),
 };
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {

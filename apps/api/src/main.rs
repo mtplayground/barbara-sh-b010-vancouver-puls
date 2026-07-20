@@ -11,6 +11,7 @@ use api::{
     error::ApiError,
     ingestion,
     invites::{self, AcceptInviteError, UserInvite},
+    schedule::{self, NewScheduleAssignment, ScheduleSlot},
     sources::{
         ContentSource, ContentSourceKind, IngestedItem, NewContentSource, UpdateContentSource,
     },
@@ -24,6 +25,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use chrono::{NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::env;
@@ -200,6 +202,38 @@ struct RenderDraftResponse {
     reel_asset_ref: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CalendarQuery {
+    start: Option<NaiveDate>,
+    days: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CalendarResponse {
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+    daily_cadence: &'static str,
+    empty_upcoming_slots: i64,
+    slots: Vec<CalendarSlotResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct CalendarSlotResponse {
+    id: Option<i64>,
+    slot_date: NaiveDate,
+    slot_time: NaiveTime,
+    draft: Option<DraftResponse>,
+    is_empty: bool,
+    is_upcoming: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignCalendarSlotRequest {
+    slot_date: NaiveDate,
+    slot_time: Option<NaiveTime>,
+    draft_id: i64,
+}
+
 #[derive(Debug, Serialize)]
 struct IngestedItemResponse {
     id: i64,
@@ -346,6 +380,8 @@ fn app(
         .route("/api/drafts/:draft_id/reject", post(reject_draft))
         .route("/api/drafts/:draft_id/regenerate", post(regenerate_draft))
         .route("/api/drafts/:draft_id/render", post(render_draft_assets))
+        .route("/api/calendar", get(list_calendar))
+        .route("/api/calendar/slots", post(assign_calendar_slot))
         .route(
             "/api/invites/accept",
             get(accept_invite_redirect).post(accept_invite),
@@ -883,6 +919,107 @@ async fn render_draft_assets(
     }))
 }
 
+async fn list_calendar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CalendarQuery>,
+) -> Result<Json<CalendarResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_schedule_content() {
+        return Err(ApiError::forbidden(
+            "content schedule permissions are required",
+        ));
+    }
+
+    let start_date = query.start.unwrap_or_else(|| Utc::now().date_naive());
+    let end_date = schedule::calendar_end_date(
+        start_date,
+        query.days.unwrap_or(schedule::DEFAULT_CALENDAR_DAYS),
+    )
+    .map_err(calendar_error)?;
+    let persisted_slots = schedule::list_schedule_slots(&state.db, start_date, end_date)
+        .await
+        .map_err(calendar_error)?;
+    let calendar_dates = schedule::calendar_dates(start_date, end_date).map_err(calendar_error)?;
+    let today = Utc::now().date_naive();
+    let mut slots = Vec::with_capacity(calendar_dates.len());
+
+    for slot_date in calendar_dates {
+        let persisted_slot = persisted_slots
+            .iter()
+            .find(|slot| slot.slot_date == slot_date);
+        let draft = match persisted_slot.and_then(|slot| slot.draft_id) {
+            Some(draft_id) => api::drafts::find_post_draft(&state.db, draft_id)
+                .await
+                .map_err(ApiError::internal)?
+                .map(DraftResponse::from),
+            None => None,
+        };
+
+        slots.push(CalendarSlotResponse::from_parts(
+            persisted_slot,
+            slot_date,
+            draft,
+            today,
+        ));
+    }
+
+    let empty_upcoming_slots = slots
+        .iter()
+        .filter(|slot| slot.is_empty && slot.is_upcoming)
+        .count() as i64;
+
+    Ok(Json(CalendarResponse {
+        start_date,
+        end_date,
+        daily_cadence: "one_post_per_day",
+        empty_upcoming_slots,
+        slots,
+    }))
+}
+
+async fn assign_calendar_slot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<AssignCalendarSlotRequest>,
+) -> Result<Json<CalendarSlotResponse>, ApiError> {
+    let authenticated = require_user(&state, &headers).await?;
+
+    if !authenticated.user.role.can_schedule_content() {
+        return Err(ApiError::forbidden(
+            "content schedule permissions are required",
+        ));
+    }
+
+    let slot = schedule::assign_approved_draft_to_slot(
+        &state.db,
+        &NewScheduleAssignment {
+            slot_date: payload.slot_date,
+            slot_time: payload.slot_time,
+            draft_id: payload.draft_id,
+            user_sub: Some(authenticated.user.sub),
+        },
+    )
+    .await
+    .map_err(calendar_error)?;
+    let draft = match slot.draft_id {
+        Some(draft_id) => api::drafts::find_post_draft(&state.db, draft_id)
+            .await
+            .map_err(ApiError::internal)?
+            .map(DraftResponse::from),
+        None => None,
+    };
+    let today = Utc::now().date_naive();
+
+    Ok(Json(CalendarSlotResponse::from_parts(
+        Some(&slot),
+        slot.slot_date,
+        draft,
+        today,
+    )))
+}
+
 async fn create_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1142,6 +1279,31 @@ fn rendering_error(error: anyhow::Error) -> ApiError {
     ApiError::internal(error)
 }
 
+fn calendar_error(error: anyhow::Error) -> ApiError {
+    let message = error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ");
+
+    if message.contains("calendar end date")
+        || message.contains("date range")
+        || message.contains("draft id must be positive")
+        || message.contains("draft was not found")
+        || message.contains("only approved drafts")
+        || message.contains("already assigned")
+        || message.contains("slot already")
+        || message.contains("cannot be in the past")
+        || message.contains("violates check constraint")
+        || message.contains("violates unique constraint")
+        || message.contains("violates foreign key constraint")
+    {
+        return ApiError::bad_request(message);
+    }
+
+    ApiError::internal(error)
+}
+
 fn source_write_error(error: anyhow::Error) -> ApiError {
     let message = error
         .chain()
@@ -1282,6 +1444,28 @@ impl From<PostDraft> for DraftResponse {
             updated_by_sub: draft.updated_by_sub,
             created_at: draft.created_at,
             updated_at: draft.updated_at,
+        }
+    }
+}
+
+impl CalendarSlotResponse {
+    fn from_parts(
+        slot: Option<&ScheduleSlot>,
+        slot_date: NaiveDate,
+        draft: Option<DraftResponse>,
+        today: NaiveDate,
+    ) -> Self {
+        let slot_time = slot
+            .map(|slot| slot.slot_time)
+            .unwrap_or_else(schedule::default_slot_time);
+
+        Self {
+            id: slot.map(|slot| slot.id),
+            slot_date,
+            slot_time,
+            is_empty: draft.is_none(),
+            is_upcoming: slot_date >= today,
+            draft,
         }
     }
 }

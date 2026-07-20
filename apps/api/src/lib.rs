@@ -10,6 +10,7 @@ pub mod error;
 pub mod ingestion;
 pub mod invites;
 pub mod rendering;
+pub mod schedule;
 pub mod sources;
 pub mod storage;
 pub mod users;
